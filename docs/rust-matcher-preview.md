@@ -91,25 +91,25 @@ switch. No devenv package, registry, or production configuration is changed.
 cargo fmt --check
 cargo test --locked
 cargo test --locked --features rust-matcher
-cargo test --locked --no-default-features --features rust-matcher \
-  --lib --test test_rust_matcher
+cargo test --locked --no-default-features --features rust-matcher
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --locked --all-targets --no-default-features \
   --features rust-matcher -- -D warnings
 ```
 
-The pure-Rust validation selects the backend/unit tests and dedicated CLI tests;
-existing `test_grep` tests also exercise `-P` and require `onig`.
+The general CLI suite gates only the assertions requiring the optional `-P`
+backend, so the Rust-only build also runs the rest of the command tests.
 
-Validated on 2026-10-23 on macOS arm64 with Rust 1.98.0-nightly
+Initial validation on 2026-10-23 used macOS arm64 with Rust 1.98.0-nightly
 (`31a9463c6`, 2026-05-25), GNU grep 3.12 as a black-box oracle, and Wasmtime
-47.0.2. This is not Linux or browser-host qualification.
+47.0.2. Further platform and minimum-version validation is recorded below;
+browser-host qualification remains separate.
 
 | Build | Passing tests |
 | --- | ---: |
 | Default Oniguruma | 115 |
 | Rust matcher plus Oniguruma `-P` | 163 |
-| Rust only: unit and dedicated CLI tests | 58 |
+| Rust only: unit, general CLI and dedicated CLI tests | 159 |
 
 All three feature configurations pass Clippy with warnings denied; formatting
 passes. The Rust-only WASIp1 release build succeeds with only

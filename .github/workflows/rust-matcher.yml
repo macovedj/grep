@@ -9,6 +9,7 @@ on:
       - src/**
       - tests/**
       - benches/**
+      - benchmarks/rust-matcher/**
   pull_request:
     paths:
       - .github/workflows/rust-matcher.yml
@@ -17,6 +18,7 @@ on:
       - src/**
       - tests/**
       - benches/**
+      - benchmarks/rust-matcher/**
   workflow_dispatch:
 
 permissions:
@@ -44,15 +46,10 @@ jobs:
         backend:
           - name: onig
             cargo-args: ""
-            test-args: ""
           - name: onig-and-rust
             cargo-args: --features rust-matcher
-            test-args: ""
           - name: rust-only
             cargo-args: --no-default-features --features rust-matcher
-            # The existing general CLI suite includes -P, which needs Onig.
-            # This suite checks the explicit error for -P in a Rust-only build.
-            test-args: --lib --test test_rust_matcher
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +62,7 @@ jobs:
       - name: Build
         run: cargo build --locked ${{ matrix.backend.cargo-args }} 2>&1 | tee build.log
       - name: Test
-        run: cargo test --locked ${{ matrix.backend.cargo-args }} ${{ matrix.backend.test-args }} 2>&1 | tee test.log
+        run: cargo test --locked ${{ matrix.backend.cargo-args }} 2>&1 | tee test.log
       - name: Clippy
         run: cargo clippy --locked --all-targets ${{ matrix.backend.cargo-args }} -- -D warnings 2>&1 | tee clippy.log
       - name: Upload validation logs
@@ -97,8 +94,8 @@ jobs:
         run: |
           rustc --version --verbose | tee toolchain.log
           cargo --version | tee -a toolchain.log
-      - name: Check the library and binary at the declared minimum Rust version
-        run: cargo check --locked --lib --bins ${{ matrix.backend.cargo-args }} 2>&1 | tee msrv.log
+      - name: Check all targets at the declared minimum Rust version
+        run: cargo check --locked --all-targets ${{ matrix.backend.cargo-args }} 2>&1 | tee msrv.log
       - name: Upload validation logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -141,6 +138,47 @@ jobs:
           name: rust-matcher-wasip1
           path: |
             target/wasm32-wasip1/release/grep.wasm
+            *.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  benchmark:
+    name: CLI benchmark report (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose | tee toolchain.log
+          cargo --version | tee -a toolchain.log
+      - name: Build matching release profiles
+        run: |
+          cargo build --locked --release --bin grep 2>&1 | tee benchmark-build-onig.log
+          cp target/release/grep "$RUNNER_TEMP/grep-default"
+          cargo build --locked --release --bin grep --features rust-matcher 2>&1 | tee benchmark-build-rust.log
+          cp target/release/grep "$RUNNER_TEMP/grep-rust"
+      - name: Collect timings and observable results
+        # Reports known compatibility differences and budget errors without
+        # calling them performance wins. This is evidence, not a speed gate.
+        run: |
+          python3 benchmarks/rust-matcher/run.py \
+            --baseline "$RUNNER_TEMP/grep-default" \
+            --candidate "$RUNNER_TEMP/grep-rust" \
+            --gnu /usr/bin/grep \
+            --source-commit "$GITHUB_SHA" \
+            --rustc "$(rustc --version --verbose)" \
+            --rounds 9 --warmups 2 --timeout 2 \
+            --output benchmarks/rust-matcher/results-linux-x86_64.json \
+            2>&1 | tee benchmark.log
+      - name: Upload benchmark report and build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-matcher-benchmark-linux
+          path: |
+            benchmarks/rust-matcher/results-linux-x86_64.json
             *.log
           if-no-files-found: ignore
           retention-days: 14
