@@ -3,6 +3,9 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
+#[cfg(not(any(feature = "onig", feature = "rust-matcher")))]
+compile_error!("enable at least one matcher feature: onig or rust-matcher");
+
 #[doc(hidden)]
 pub mod context_buffer;
 #[doc(hidden)]

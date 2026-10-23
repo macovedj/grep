@@ -5,16 +5,27 @@
 
 use crate::{Config, RegexMode};
 use memchr::memmem;
+#[cfg(feature = "onig")]
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
+#[cfg(feature = "onig")]
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
+#[cfg(feature = "onig")]
 use std::ptr::{null, null_mut};
+#[cfg(feature = "onig")]
 use std::sync::Mutex;
 use uucore::error::{UResult, USimpleError};
+#[cfg(feature = "onig")]
 use uucore::show_warning;
 
+#[cfg(feature = "onig")]
 static ONIG_NEW_MUTEX: Mutex<()> = Mutex::new(());
+
+#[cfg(feature = "rust-matcher")]
+mod gnu_syntax;
+#[cfg(feature = "rust-matcher")]
+mod rust_backend;
 
 pub struct Matcher<'a> {
     config: &'a Config<'a>,
@@ -62,60 +73,68 @@ impl<'a> Matcher<'a> {
     }
 
     /// Decide whether `line` matches and return the positions to highlight.
-    pub fn match_line(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn match_line(&self, line: &[u8]) -> UResult<Option<Vec<(usize, usize)>>> {
         let mut any_seen = false;
         let mut any_selected = false;
-        let positions: Vec<_> = MatchIter::new(&self.patterns, line)
-            .filter(|&(start, end)| {
-                any_seen = true;
-                // Drop matches that don't span the whole line if `-x` was requested.
-                if self.config.line_regexp && !(start == 0 && end == line.len()) {
-                    return false;
-                }
-                // Drop matches that aren't word matches if `-w` was requested.
-                if self.config.word_regexp && !Self::is_word_match(line, start, end) {
-                    return false;
-                }
-                any_selected = true;
-                // Drop zero-length matches from the output.
-                if start == end {
-                    return false;
-                }
-                true
-            })
-            .collect();
-
+        let mut positions = Vec::new();
+        let mut matches = MatchIter::new(&self.patterns, line)?;
+        while let Some((start, end)) = matches.next_match()? {
+            any_seen = true;
+            if self.config.line_regexp && !(start == 0 && end == line.len()) {
+                continue;
+            }
+            if self.config.word_regexp && !self.is_word_match(line, start, end) {
+                continue;
+            }
+            any_selected = true;
+            // Empty matches select lines but have no printable span for -o.
+            if start != end {
+                positions.push((start, end));
+            }
+        }
         let raw_matched = if self.config.line_regexp || self.config.word_regexp {
-            // -w / -x are authoritative once matches are filtered. Zero-length
-            // matches can select a line even though there is no span to output.
             any_selected
         } else {
             any_seen
         };
-
-        if raw_matched != self.config.invert_match {
-            Some(positions)
-        } else {
-            None
-        }
+        Ok((raw_matched != self.config.invert_match).then_some(positions))
     }
 
     /// Cheap match check that doesn't enumerate positions.
-    pub fn is_match(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
-        // `-w` / `-x` need positions to filter, so we fall back to `match_line`.
-        let matched = if self.config.line_regexp || self.config.word_regexp {
-            self.match_line(line).is_some()
-        } else {
-            let raw_matched = self.patterns.iter().any(|p| p.is_match(line));
-            raw_matched != self.config.invert_match
-        };
-        matched.then(Vec::new)
+    pub fn is_match(&self, line: &[u8]) -> UResult<Option<Vec<(usize, usize)>>> {
+        if self.config.line_regexp || self.config.word_regexp {
+            return self.match_line(line);
+        }
+        let mut raw_matched = false;
+        for pattern in &self.patterns {
+            if pattern.is_match(line)? {
+                raw_matched = true;
+                break;
+            }
+        }
+        Ok((raw_matched != self.config.invert_match).then(Vec::new))
     }
 
     /// Word-boundary check `-w`.
     /// NOTE that `-w` does not check both sides, unlike `\b` in a regex.
     /// Start/End-of-line count as non-words.
-    fn is_word_match(line: &[u8], start: usize, end: usize) -> bool {
+    fn is_word_match(&self, line: &[u8], start: usize, end: usize) -> bool {
+        #[cfg(feature = "rust-matcher")]
+        if let Some(CompiledPattern::Rust(pattern)) = self.patterns.first() {
+            return pattern.is_word_match(line, start, end);
+        }
+        #[cfg(feature = "onig")]
+        {
+            Self::onig_word_match(line, start, end)
+        }
+        #[cfg(not(feature = "onig"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "onig")]
+    fn onig_word_match(line: &[u8], start: usize, end: usize) -> bool {
         // SAFETY: This code uses OnigEncodingType such that it can support other types of encodings in the future.
         unsafe {
             let mbc_to_code = OnigEncodingUTF8.mbc_to_code.unwrap_unchecked();
@@ -151,53 +170,45 @@ struct MatchIter<'a> {
 }
 
 impl<'a> MatchIter<'a> {
-    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> Self {
-        Self {
-            cursors: patterns
-                .iter()
-                .map(|pattern| {
-                    let mut c = Cursor {
-                        pattern,
-                        line,
-                        offset: 0,
-                        pending: None,
-                    };
-                    c.refill();
-                    c
-                })
-                .collect(),
-            last_end: 0,
+    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> UResult<Self> {
+        let mut cursors = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            let mut cursor = Cursor {
+                pattern,
+                line,
+                offset: 0,
+                pending: None,
+            };
+            cursor.refill()?;
+            cursors.push(cursor);
         }
+        Ok(Self {
+            cursors,
+            last_end: 0,
+        })
     }
-}
 
-impl<'a> Iterator for MatchIter<'a> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Discard stale pendings that fall before the last emit.
+    fn next_match(&mut self) -> UResult<Option<(usize, usize)>> {
+        // Discard pending matches covered by the previous emitted span.
         for cursor in &mut self.cursors {
             if matches!(cursor.pending, Some((s, _)) if s < self.last_end) {
                 cursor.offset = self.last_end;
-                cursor.refill();
+                cursor.refill()?;
             }
         }
-
-        // Pick the leftmost pending.
-        // Tie-break by largest end so POSIX leftmost-longest holds across
-        // patterns too (e.g. `-e a -e ab` against `ab` emits `ab`).
-        let best_idx = self
+        // Merge patterns by earliest start, breaking ties by longest extent.
+        let best = self
             .cursors
             .iter()
             .enumerate()
             .filter_map(|(i, c)| c.pending.map(|p| (i, p)))
-            .min_by_key(|&(_, (s, e))| (s, std::cmp::Reverse(e)))
-            .map(|(i, _)| i)?;
-
-        let (start, end) = self.cursors[best_idx].pending.unwrap();
-        self.cursors[best_idx].refill();
+            .min_by_key(|&(_, (s, e))| (s, std::cmp::Reverse(e)));
+        let Some((best_idx, (start, end))) = best else {
+            return Ok(None);
+        };
+        self.cursors[best_idx].refill()?;
         self.last_end = end;
-        Some((start, end))
+        Ok(Some((start, end)))
     }
 }
 
@@ -212,24 +223,25 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn refill(&mut self) {
+    fn refill(&mut self) -> UResult<()> {
         if self.offset > self.line.len() {
             self.pending = None;
-            return;
+            return Ok(());
         }
-        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)
+        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)?
         else {
             self.pending = None;
-            return;
+            return Ok(());
         };
         let end = self
             .pattern
-            .longest_end_at(self.line, start)
+            .longest_end_at(self.line, start)?
             .unwrap_or(leftmost_end);
         // Advance the next search past the match we just found.
         // Zero-length matches need a +1 nudge to avoid spinning forever.
         self.offset = end.max(start + 1);
         self.pending = Some((start, end));
+        Ok(())
     }
 }
 
@@ -252,7 +264,79 @@ fn plain_literal(pattern: &str, ignore_case: bool, mode: RegexMode) -> Option<Ve
     plain.then(|| pattern.as_bytes().to_vec())
 }
 
-struct CompiledPattern {
+enum CompiledPattern {
+    #[cfg(feature = "onig")]
+    Onig(OnigPattern),
+    #[cfg(feature = "rust-matcher")]
+    Rust(rust_backend::RustPattern),
+}
+
+impl CompiledPattern {
+    fn compile(pattern: &str, config: &Config) -> UResult<Self> {
+        #[cfg(feature = "rust-matcher")]
+        if config.regex_mode != RegexMode::Perl {
+            return rust_backend::RustPattern::compile(pattern, config).map(Self::Rust);
+        }
+        #[cfg(feature = "onig")]
+        {
+            OnigPattern::compile(pattern, config).map(Self::Onig)
+        }
+        #[cfg(not(feature = "onig"))]
+        {
+            Err(USimpleError::new(
+                2,
+                "-P requires the onig feature in this experimental build",
+            ))
+        }
+    }
+
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> UResult<Option<(usize, usize)>> {
+        let found = match self {
+            #[cfg(feature = "onig")]
+            Self::Onig(pattern) => pattern.search_leftmost(line, offset),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.search_leftmost(line, offset)?,
+        };
+        // Every backend must preserve original byte offsets and stay within
+        // the input. In particular, a malformed-byte Onig match must never
+        // reach the output code with an out-of-bounds capture.
+        if found.is_some_and(|(start, end)| start < offset || start > end || end > line.len()) {
+            return Err(USimpleError::new(
+                2,
+                "matcher returned a span outside the input",
+            ));
+        }
+        Ok(found)
+    }
+
+    fn longest_end_at(&self, line: &[u8], start: usize) -> UResult<Option<usize>> {
+        let end = match self {
+            #[cfg(feature = "onig")]
+            Self::Onig(pattern) => pattern.longest_end_at(line, start),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.longest_end_at(line, start)?,
+        };
+        if end.is_some_and(|end| end < start || end > line.len()) {
+            return Err(USimpleError::new(
+                2,
+                "matcher returned a span outside the input",
+            ));
+        }
+        Ok(end)
+    }
+
+    fn is_match(&self, line: &[u8]) -> UResult<bool> {
+        match self {
+            #[cfg(feature = "onig")]
+            Self::Onig(pattern) => Ok(pattern.is_match(line)),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.is_match(line),
+        }
+    }
+}
+
+#[cfg(feature = "onig")]
+struct OnigPattern {
     /// Default semantics. It's decently fast and used for searching.
     leftmost: OnigRegex,
     /// Compiled with `FIND_LONGEST`. If used for a search, it'll search the
@@ -261,7 +345,8 @@ struct CompiledPattern {
     longest_anchored: OnigRegex,
 }
 
-impl CompiledPattern {
+#[cfg(feature = "onig")]
+impl OnigPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
         let mut syntax = *match config.regex_mode {
             RegexMode::Fixed => Syntax::asis(),
@@ -372,17 +457,21 @@ impl CompiledPattern {
     }
 }
 
+#[cfg(feature = "onig")]
 struct OnigRegex {
     raw: onig_sys::OnigRegex,
 }
 
 // SAFETY: Oniguruma compiled regexes are immutable after construction, and this
 // wrapper owns and frees the raw pointer exactly once. This mirrors `onig::Regex`.
+#[cfg(feature = "onig")]
 unsafe impl Send for OnigRegex {}
 // SAFETY: Searches only read the compiled regex. Capture storage is caller-owned
 // through `Region`, so sharing the compiled regex across threads is safe.
+#[cfg(feature = "onig")]
 unsafe impl Sync for OnigRegex {}
 
+#[cfg(feature = "onig")]
 impl OnigRegex {
     fn compile(pattern: &str, syntax: &Syntax, options: RegexOptions) -> Result<Self, OnigError> {
         let pattern = pattern.as_bytes();
@@ -468,6 +557,7 @@ impl OnigRegex {
     }
 }
 
+#[cfg(feature = "onig")]
 impl Drop for OnigRegex {
     fn drop(&mut self) {
         // SAFETY: `raw` was returned by a successful `onig_new_deluxe` call and
@@ -476,11 +566,13 @@ impl Drop for OnigRegex {
     }
 }
 
+#[cfg(feature = "onig")]
 struct OnigError {
     code: i32,
     message: String,
 }
 
+#[cfg(feature = "onig")]
 impl OnigError {
     fn new(code: i32, info: *const onig_sys::OnigErrorInfo) -> Self {
         Self {
@@ -490,12 +582,14 @@ impl OnigError {
     }
 }
 
+#[cfg(feature = "onig")]
 fn region_ptr(region: Option<&mut Region>) -> *mut onig_sys::OnigRegion {
     region.map_or(null_mut(), |r| {
         r as *mut Region as *mut onig_sys::OnigRegion
     })
 }
 
+#[cfg(feature = "onig")]
 fn onig_match_result(result: i32) -> Option<usize> {
     if result >= 0 {
         Some(result as usize)
@@ -509,12 +603,14 @@ fn onig_match_result(result: i32) -> Option<usize> {
     }
 }
 
+#[cfg(feature = "onig")]
 fn onig_error_message(code: i32, info: *const onig_sys::OnigErrorInfo) -> String {
     let mut buff = [0; onig_sys::ONIG_MAX_ERROR_MESSAGE_LEN as usize];
     let len = unsafe { onig_sys::onig_error_code_to_str(buff.as_mut_ptr(), code, info) };
     String::from_utf8_lossy(&buff[..len as usize]).into_owned()
 }
 
+#[cfg(feature = "onig")]
 fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> {
     match pattern.as_bytes().first()? {
         b'?' => Some(("?", &pattern[1..])),
@@ -525,6 +621,7 @@ fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> 
     }
 }
 
+#[cfg(feature = "onig")]
 fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
     let close = pattern.as_bytes().iter().position(|&b| b == b'}')?;
     let body = &pattern[1..close];
@@ -539,6 +636,7 @@ fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
 /// those: a bracket whose first and last characters are colons, that holds at
 /// least one other character, and that contains no range, class, equivalence
 /// class or collating element.
+#[cfg(feature = "onig")]
 fn has_confusing_bracket(pattern: &[u8]) -> bool {
     let mut i = 0;
     while i < pattern.len() {
@@ -560,6 +658,7 @@ fn has_confusing_bracket(pattern: &[u8]) -> bool {
 /// Scan the body of a bracket expression starting at `start` (just past the
 /// `[`). Returns whether it is a misspelled character class and the index just
 /// past its closing `]`.
+#[cfg(feature = "onig")]
 fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
     const FIRST_IS_COLON: u8 = 1;
     const LAST_IS_COLON: u8 = 2;
@@ -610,6 +709,7 @@ fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
 
 /// Index just past the `:]`, `.]` or `=]` closing a `[: [. [=` subexpression
 /// whose body starts at `start`.
+#[cfg(feature = "onig")]
 fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Option<usize> {
     (start..pattern.len().saturating_sub(1))
         .find(|&i| pattern[i] == delimiter && pattern[i + 1] == b']')
@@ -618,7 +718,9 @@ fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{has_confusing_bracket, plain_literal};
+    #[cfg(feature = "onig")]
+    use super::has_confusing_bracket;
+    use super::plain_literal;
     use crate::RegexMode;
 
     fn lit(p: &str, ic: bool, mode: RegexMode) -> Option<Vec<u8>> {
@@ -661,6 +763,7 @@ mod tests {
         assert_eq!(lit("naïve", false, RegexMode::Basic), None);
     }
 
+    #[cfg(feature = "onig")]
     #[test]
     fn detects_misspelled_character_classes() {
         for p in [
@@ -675,6 +778,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "onig")]
     #[test]
     fn accepts_bracket_expressions_that_are_not_confusing() {
         for p in [
