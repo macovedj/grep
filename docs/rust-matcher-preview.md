@@ -139,4 +139,54 @@ fallback input, and a retained `-P` invalid span now diagnosed instead of silent
 ignored. Repeated probes overlap bug families, so these counts are **not a GNU
 compatibility percentage**. No timeouts or panics occurred in the candidate run.
 This evidence supports further work on the adapter and engines, not a default
-switch. End-to-end performance and Linux qualification remain outstanding.
+switch. Whole-command performance and platform results follow below.
+
+
+## Further qualification
+
+The [feature-specific CI run](https://github.com/macovedj/grep/actions/runs/40010552080)
+passed all 15 jobs for commit `e3f53e574706283fb5c0ebe9ab0370a105f369d9`:
+
+- Stable Rust: build, full applicable test suite and Clippy with warnings denied
+  on Linux, macOS and Windows for default Oniguruma, both engines, and Rust only.
+- Rust 1.88: `cargo check --locked --all-targets` for all three configurations
+  on Linux. Local macOS Rust 1.88 execution also passes 115 default, 163 mixed,
+  and 159 Rust-only tests, without dependency or lockfile changes.
+- Formatting, a Rust-only WASIp1 release build, and a Linux benchmark report.
+
+The general test suite now gates only successful `-P` assertions requiring
+Oniguruma. Rust-only builds retain 101 general CLI tests as well as 37 unit and
+21 dedicated integration tests. CI exposed races in two existing invalid-option
+tests: argument parsing could exit before their stdin writer ran. Those cases
+now assert argument failure without an unnecessary competing input writer.
+
+[`benchmarks/rust-matcher`](../benchmarks/rust-matcher/README.md) contains a
+portable whole-command benchmark and the macOS results. The
+[Linux report](benchmarks/rust-matcher-linux-x86_64.json) is preserved from the
+CI artifact for the checked commit. Each report uses 20 deterministic cases,
+two warmups and nine alternating timing rounds; GNU is a black-box correctness
+reference. Ratios are emitted only for successful equivalent output/status in
+both builds and GNU. The three known differing/error cases have no speedup
+ratio, and neither platform run has timeouts or invalid timed samples.
+
+Selected final Linux whole-command medians, in milliseconds:
+
+| Case | Oniguruma | Rust | Rust / Oniguruma |
+| --- | ---: | ---: | ---: |
+| Empty input, bounded Unicode word expression | 0.83 | 67.98 | 81.59 |
+| Empty input, 128-branch expression | 1.24 | 21.48 | 17.38 |
+| Short-line count, 5.4 MB | 52.67 | 13.86 | 0.26 |
+| Repeated alternations with `-o`, 1.05 MB | 54.48 | 13.85 | 0.25 |
+| Unicode words with `-o`, 2.56 MB | 87.70 | 35.22 | 0.40 |
+
+The Linux oracle is GNU grep 3.11 and the compiler is Rust 1.99.1; the macOS
+oracle is GNU grep 3.12 and its compiler is the recorded 1.98 nightly. Both
+platforms have 17 GNU-agreeing benchmark cases and the same three known
+exceptions. Their differing machines and compilers make cross-platform timing
+ratios uncontrolled comparisons. These are synthetic warm-cache measurements,
+with raw samples retained and no overall performance score.
+
+The scan results are encouraging, while the new startup/compilation latency is
+a substantive regression. The bounded fallback and Unicode compatibility gaps
+also remain. This supports discussing an experimental feature upstream; these
+checks do not establish readiness to replace the default backend.
