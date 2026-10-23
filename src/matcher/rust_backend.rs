@@ -172,7 +172,7 @@ impl RustPattern {
                 .find(Input::new(line).range(offset..line.len()))
                 .map(|found| (found.start(), found.end()))),
             Engine::Backtracking(backtracking) => {
-                let offset = self.fancy_offset(line, offset)?;
+                let offset = self.fancy_offset(line, offset);
                 backtracking
                     .first
                     .find_from_pos(line, offset)
@@ -214,7 +214,7 @@ impl RustPattern {
                 }
             }
             Engine::Backtracking(backtracking) => {
-                if self.fancy_offset(line, start)? != start {
+                if self.fancy_offset(line, start) != start {
                     return Ok(None);
                 }
                 backtracking
@@ -229,38 +229,37 @@ impl RustPattern {
     pub(super) fn is_match(&self, line: &[u8]) -> UResult<bool> {
         match &self.engine {
             Engine::Regular(regular) => Ok(regular.first.is_match(line)),
-            Engine::Backtracking(backtracking) => {
-                self.fancy_offset(line, 0)?;
-                backtracking
-                    .first
-                    .is_match(line)
-                    .map_err(|e| error(format!("match failed: {e}")))
-            }
+            Engine::Backtracking(backtracking) => backtracking
+                .first
+                .is_match(line)
+                .map_err(|e| error(format!("match failed: {e}"))),
         }
     }
 
-    /// Stock fancy-regex 0.19.2 can skip valid bytes or panic when its Unicode
-    /// VM encounters malformed UTF-8, and its ASCII VM can miss high-byte
-    /// backreferences. Reject those inputs before entering that VM until the
-    /// engine fixes are upstream. The regular engine continues to search
-    /// arbitrary byte strings without this guard.
-    fn fancy_offset(&self, line: &[u8], mut offset: usize) -> UResult<usize> {
-        if self.profile == TextProfile::Ascii && !line.is_ascii() {
-            return Err(error(
-                "backreference or assertion matching on non-ASCII bytes in the C locale is not supported yet",
-            ));
-        }
-        if self.profile.unicode() {
-            let text = std::str::from_utf8(line).map_err(|_| {
-                error("backreference or assertion matching on invalid UTF-8 is not supported yet")
-            })?;
-            // The caller advances one byte after empty matches. Do not begin a
-            // Unicode VM search in the middle of an otherwise valid scalar.
-            while !text.is_char_boundary(offset) {
-                offset += 1;
+    /// Empty matches advance the caller by one byte. Preserve Unicode scalar
+    /// boundaries when that lands inside a valid encoding, even if another
+    /// part of the line contains malformed bytes. Standalone malformed bytes
+    /// remain searchable positions. The local engine override handles recovery.
+    fn fancy_offset(&self, line: &[u8], offset: usize) -> usize {
+        if self.profile.unicode() && offset < line.len() && line[offset] & 0xc0 == 0x80 {
+            for start in offset.saturating_sub(3)..offset {
+                let width = match line[start] {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => continue,
+                };
+                let end = start + width;
+                if end > offset
+                    && line
+                        .get(start..end)
+                        .is_some_and(|bytes| std::str::from_utf8(bytes).is_ok())
+                {
+                    return end;
+                }
             }
         }
-        Ok(offset)
+        offset
     }
 
     pub(super) fn is_word_match(&self, line: &[u8], start: usize, end: usize) -> bool {
@@ -436,16 +435,20 @@ mod tests {
     }
 
     #[test]
-    fn unicode_fancy_rejects_malformed_input_before_entering_the_vm() {
+    fn unicode_fancy_recovers_after_malformed_input() {
         let pattern = compile(r"(.)\1", TextProfile::Unicode);
         assert!(matches!(pattern.engine, Engine::Backtracking(_)));
-        // A truncated multibyte lead exposed an out-of-bounds slice in the
-        // stock engine during the standalone investigation.
         for line in [b"\xE2".as_slice(), b"\xE2\x82b", b"a\x80a"] {
-            assert!(pattern.search_leftmost(line, 0).is_err());
-            assert!(pattern.longest_end_at(line, 0).is_err());
-            assert!(pattern.is_match(line).is_err());
+            assert_eq!(pattern.search_leftmost(line, 0).unwrap(), None);
+            assert_eq!(pattern.longest_end_at(line, 0).unwrap(), None);
+            assert!(!pattern.is_match(line).unwrap());
         }
+        assert_eq!(
+            pattern.search_leftmost(b"\xE2\x82bb", 0).unwrap(),
+            Some((2, 4))
+        );
+        assert_eq!(pattern.longest_end_at(b"\xE2\x82bb", 2).unwrap(), Some(4));
+        assert!(pattern.is_match(b"\xE2\x82bb").unwrap());
     }
 
     #[test]
@@ -456,15 +459,20 @@ mod tests {
             Some((2, 2))
         );
         assert_eq!(pattern.longest_end_at("é".as_bytes(), 1).unwrap(), None);
+        let malformed = b"\xFF\xC3\xA9\x80";
+        assert_eq!(pattern.search_leftmost(malformed, 2).unwrap(), Some((3, 3)));
+        assert_eq!(pattern.longest_end_at(malformed, 2).unwrap(), None);
+        assert_eq!(pattern.fancy_offset(malformed, 3), 3);
     }
 
     #[test]
-    fn c_fancy_rejects_non_ascii_input_before_entering_the_vm() {
+    fn c_fancy_matches_raw_byte_backreferences() {
         let pattern = compile(r"(.)\1", TextProfile::Ascii);
-        for line in [b"\x80\x80".as_slice(), "éé".as_bytes()] {
-            assert!(pattern.search_leftmost(line, 0).is_err());
-            assert!(pattern.longest_end_at(line, 0).is_err());
-            assert!(pattern.is_match(line).is_err());
+        for byte in 0x80..=0xff {
+            let line = [byte, byte];
+            assert_eq!(pattern.search_leftmost(&line, 0).unwrap(), Some((0, 2)));
+            assert_eq!(pattern.longest_end_at(&line, 0).unwrap(), Some(2));
+            assert!(pattern.is_match(&line).unwrap());
         }
     }
 

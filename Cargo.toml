@@ -60,3 +60,8 @@ codegen-units = 1
 
 [profile.dist]
 inherits = "release"
+
+# Local qualification only. Replace with a released engine dependency before
+# proposing the grep integration upstream; see docs/rust-matcher-preview.md.
+[patch.crates-io]
+fancy-regex = { path = "../fancy-regex-byte-fix" }

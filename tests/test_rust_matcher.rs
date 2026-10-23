@@ -235,31 +235,41 @@ fn backtracking_limit_is_an_error_instead_of_a_nonmatch() {
 }
 
 #[test]
-fn malformed_utf8_on_the_backreference_fallback_is_an_explicit_error() {
-    // The experimental fallback deliberately refuses malformed UTF-8 until
-    // its byte-search fixes can be supplied by an upstream engine release.
-    let output = grep("C.UTF-8", &["-aEo", r"(a)\1"], b"\xffaa\n");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    assert!(
-        stderr.contains("utf-8") || stderr.contains("utf8"),
-        "{stderr}"
+fn unicode_backreferences_recover_after_malformed_bytes() {
+    assert_output("C.UTF-8", &["-aEbo", r"(a)\1"], b"\xffaa\n", b"1:aa\n", 0);
+    assert_output(
+        "C.UTF-8",
+        &["-aEbo", r"(.)\1"],
+        b"\xe2\x82bb\n",
+        b"2:bb\n",
+        0,
     );
+    assert_output(
+        "C.UTF-8",
+        &["-aEo", r"^(.)\1$"],
+        b"\xc0\xaf\xc0\xaf\n",
+        b"",
+        1,
+    );
+    assert_output("C.UTF-8", &["-aEo", r"(.)\1"], b"\xe2\n", b"", 1);
 }
 
 #[test]
-fn non_ascii_bytes_on_the_c_locale_backreference_fallback_are_an_error() {
-    // The stock fallback also has byte-mode backreference gaps. Refusing this
-    // input preserves an explicit limitation instead of reporting no match.
-    let output = grep("C", &["-ao", r"^\(.\)\1$"], b"\x80\x80\n");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    assert!(
-        stderr.contains("ascii") || stderr.contains("byte"),
-        "{stderr}"
+fn c_locale_backreferences_preserve_raw_bytes() {
+    assert_output(
+        "C",
+        &["-abo", r"^\(.\)\1$"],
+        b"\x80\x80\n",
+        b"0:\x80\x80\n",
+        0,
     );
+    assert_output("C", &["-aEbo", r"(ab)\1"], b"\xffabab\n", b"1:abab\n", 0);
+}
+
+#[test]
+fn case_insensitive_backreferences_ignore_surrounding_malformed_bytes() {
+    assert_output("C.UTF-8", &["-aEibo", r"(a)\1"], b"Aa\x80\n", b"0:Aa\n", 0);
+    assert_output("C", &["-aEibo", r"(a)\1"], b"Aa\x80\n", b"0:Aa\n", 0);
 }
 
 #[test]

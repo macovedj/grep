@@ -6,6 +6,16 @@ The default build still uses Oniguruma. Enabling `rust-matcher` switches
 retains the existing `-P` implementation. This is an initial integration, not a
 proposal to change the default or a complete GNU compatibility claim.
 
+This local byte-integration branch additionally overrides `fancy-regex` with
+the adjacent `../fancy-regex-byte-fix` checkout. It must be present to build.
+That checkout is based on upstream `d18bf81b6d796d3d60674f3ef4a7d7fa8763bdc0`
+plus local commits `6c903f7` (case-insensitive byte boundaries) and `e812cbf`
+(UnicodeBytes VM traversal and scalar consumption). The sibling override is
+qualification infrastructure; replace it with a released engine dependency
+before proposing this grep integration upstream. Version `0.19.2` alone does
+not identify these sources: upstream main and the older published crate both
+declare that version. The preceding preview remains on released dependencies.
+
 ## Try it
 
 ```sh
@@ -61,12 +71,17 @@ reference executable. No GNU implementation source or regex engine is included.
   produce an unsupported diagnostic. This does not implement libc collation,
   locale-specific case folding, or GNU Unicode character classes. POSIX classes
   retain Rust's ASCII membership; Unicode word classes retain Rust's membership.
-- **Fallback input scope:** the regular path searches arbitrary byte strings.
-  Stock fancy-regex has known malformed-UTF-8 VM bugs and a C-mode non-ASCII
-  backreference bug. Before entering that fallback, this branch rejects invalid
-  UTF-8 in the Unicode profile and non-ASCII input in the C profile with status
-  2. This avoids exposing those known wrong answers or panics. The separate
-  experimental engine patch has not been incorporated or published here.
+- **Byte-engine dependency:** with the local engine override above, the
+  fallback no longer blanket-rejects C-locale high bytes or malformed UTF-8.
+  Search recovery steps over malformed bytes; Unicode consuming dots still
+  require valid scalars. C mode retains raw-byte matching. Case-insensitive
+  backreferences validate the compared bytes rather than unrelated adjacent
+  malformed bytes. This depends on both upstream changes since the published
+  release and the local fixes; removing the override is not qualified.
+- **Word-boundary policy:** Rust Unicode membership and behavior around
+  malformed input still differ from GNU. For example, bare `\b` on bytes
+  `E2 28 A1` in C.UTF-8 returns status 1 here but status 0 in GNU despite both
+  printing no spans. This is an explicit remaining compatibility difference.
 - **Resource scope:** the lazy DFA has an 8 MiB transition-cache capacity;
   this does not bound total regex/NFA memory. A full cache can clear and rebuild,
   so cache churn can increase matching cost. This replaces the original eager
@@ -85,9 +100,10 @@ reference executable. No GNU implementation source or regex engine is included.
   including longest selection of lazy expressions. A Rust-only build has no
   PCRE replacement.
 
-This branch deliberately uses released engine crates, with no vendored fork.
-Removing these restrictions is follow-on work before considering a default
-switch. No devenv package, registry, or production configuration is changed.
+The local engine checkout is an experimental dependency until suitable engine
+changes are released. Remaining class, word, resource, and command gaps still
+need work before considering a default switch. No devenv package, registry,
+or production configuration is changed.
 
 ## Validation
 
@@ -251,3 +267,51 @@ Local checks after the change:
 
 These are local results. The CI run above validates the earlier commit and has
 not been rerun for this follow-up.
+
+## Local byte-engine qualification
+
+The engine changes are kept in a separate repository and two focused commits.
+One fixes case-insensitive backreferences beside malformed bytes; the other
+distinguishes candidate advancement from scalar-consuming instructions, with
+validated forward/reverse UnicodeBytes traversal. The optimized absent repeater
+uses the same scalar consumption as its expanded form. Tests cover seek on/off,
+longest on/off, captures and iteration, bounded/anchored searches, valid Unicode,
+malformed/truncated encodings, and raw ASCII-mode high bytes.
+
+Current upstream already supplies relevant ASCII/byte fixes, including
+[PR 300](https://github.com/fancy-regex/fancy-regex/pull/300). Those are reused,
+not reimplemented in the local patch. The new UnicodeBytes recovery regressions
+still fail on current upstream: six of the initial nine tests fail, including
+a truncated-input panic. The independent case-insensitive regression was also
+observed failing before its fix.
+
+Local evidence after applying both engine commits:
+
+- Engine: 727 default tests and 753 with `leftmost_longest`; examples (12),
+  playground (37), no-default feature checks, benches, and formatting pass.
+- Grep: 170 tests with both engines; 166 Rust-only tests. The backtracking budget
+  remains an explicit status-2 error.
+- The original 99 targeted probes improve from 80 to 90 GNU stdout/status
+  agreements. Nine differences remain in Unicode classes, word membership,
+  and malformed-input word-boundary selection.
+- A further 97 byte-focused probes improve from 16 to 89 agreements. The eight
+  remaining differences are three word policies, two POSIX class policies,
+  and three backtracking-budget cases. These selected counts are not an overall
+  GNU compatibility percentage.
+- The 1,159-case adversarial corpus gains 17 exact GNU agreements and loses
+  none: 1,033 exact observations, 75 stdout/status differences, and 51 stderr-only
+  differences. Two additional changed observations remain behavior differences.
+- All 196 targeted native/Wasmtime observations agree, including known GNU
+  differences. This is host parity, not a compatibility claim.
+
+Four affected-path CLI benchmarks also retain GNU output/status agreement on
+valid input. Against the preceding guarded preview, local medians are 3.12 vs
+3.19 ms for ASCII backreference count, 6.40 vs 6.22 ms for ASCII spans, 10.98 vs
+9.57 ms for Unicode spans, and 13.22 vs 12.65 ms for Unicode case-folded spans.
+These warm-cache samples include the intervening upstream engine changes;
+they do not isolate the cost of either local engine commit or establish a
+general speedup. The earlier startup/scan tradeoffs remain relevant.
+
+The earlier benchmark and CI records above apply to their recorded commits.
+These byte changes have been qualified locally and have not been published or
+run through GitHub CI.
