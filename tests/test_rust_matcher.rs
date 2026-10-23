@@ -60,6 +60,54 @@ fn bre_translates_escaped_operators_and_preserves_literal_operators() {
 }
 
 #[test]
+fn bre_repetition_operators_are_literal_without_a_preceding_atom() {
+    for (operator, input) in [
+        (r"\+", b"+a\n".as_slice()),
+        (r"\?", b"?a\n".as_slice()),
+        (r"\{1\}", b"{1}a\n".as_slice()),
+        (r"\{bogus\}", b"{bogus}a\n".as_slice()),
+        (r"\{", b"{a\n".as_slice()),
+    ] {
+        for (prefix, suffix) in [
+            ("", ""),
+            ("^", ""),
+            (r"\(", r"\)"),
+            (r"z\|^", ""),
+            (r"\(^", r"\)"),
+            (r"\B", ""),
+            (r"\`", ""),
+        ] {
+            let pattern = format!("{prefix}{operator}a{suffix}");
+            assert_output("C", &["-o", &pattern], input, input, 0);
+        }
+    }
+
+    let output = grep("C", &["-o", r"\+a"], b"+a\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stray \\ before +"));
+}
+
+#[test]
+fn bre_brackets_keep_parentheses_backslashes_and_set_operators_literal() {
+    assert_output("C", &["-o", r"[\(]"], b"(\\5\n", b"(\n\\\n", 0);
+    assert_output("C", &["-o", r"[\)]"], b")\\5\n", b")\n\\\n", 0);
+    assert_output("C", &["-o", r"[\d]"], b"d\\5\n", b"d\n\\\n", 0);
+    assert_output("C", &["-o", "[a&&b]"], b"a&b\n", b"a\n&\nb\n", 0);
+}
+
+#[test]
+fn bre_repetitions_and_backreferences_do_not_acquire_rust_syntax() {
+    assert_output("C", &["-o", r"x\+\?y"], b"y\nxxy\n", b"y\nxxy\n", 0);
+    assert_output("C", &["-o", r"\(a\)\10"], b"aa0\naa1\n", b"aa0\n", 0);
+}
+
+#[test]
+fn bre_anchors_apply_to_the_original_record_and_complete_alternation() {
+    assert_output("C", &["-o", r"^\(a\|b\)"], b"xb\na\nb\n", b"a\nb\n", 0);
+    assert_output("C", &["-o", r"\`a"], b"a\nba\n", b"a\n", 0);
+    assert_output("C", &["-o", r"a\'"], b"a\nab\n", b"a\n", 0);
+}
+
+#[test]
 fn bre_whitespace_extension_and_unknown_escape_have_grep_meaning() {
     assert_output("C", &["-o", r"\s"], b"a b\na\tb\n", b" \n\t\n", 0);
     // In GNU BRE/ERE, \d means a literal d rather than a Rust digit class.

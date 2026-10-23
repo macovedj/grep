@@ -109,6 +109,15 @@ pub(super) fn translate(pattern: &str, mode: RegexMode) -> UResult<String> {
                 atom_start = None;
                 repeated = false;
             }
+            '+' | '?' | '{' if basic && escaped && atom_start.is_none() => {
+                // With no preceding atom, GNU BRE quotes these operators.
+                // A leading \{ is literal even when no valid interval follows.
+                show_warning!("stray \\ before {token}");
+                literal(&mut output, token);
+                atom_start = Some(start);
+                repeated = false;
+                branch_start = false;
+            }
             '+' | '?' if special => {
                 if !basic && atom_start.is_none() {
                     show_warning!("{token} at start of expression");
@@ -459,6 +468,25 @@ mod tests {
             (r"^a$\|\(^b$\)", r"^a$|(^b$)"),
             (r"^*a", r"^\*a"),
             (r"\(a\)\10", r"(a)(?:\1)0"),
+        ] {
+            assert_eq!(translate(pattern, Basic).expect(pattern), expected);
+        }
+    }
+
+    #[test]
+    fn bre_repetition_operators_without_an_atom_are_literal() {
+        for (pattern, expected) in [
+            (r"\+a", r"\+a"),
+            (r"\?a", r"\?a"),
+            (r"\{1\}a", r"\{1\}a"),
+            (r"\{bogus\}a", r"\{bogus\}a"),
+            (r"\{a", r"\{a"),
+            (r"^\+a", r"^\+a"),
+            (r"\(\?a\)", r"(\?a)"),
+            (r"z\|\{1\}a", r"z|\{1\}a"),
+            (r"\(^\+a\)", r"(^\+a)"),
+            (r"\B\?a", r"\B\?a"),
+            (r"\`\{a", r"\A\{a"),
         ] {
             assert_eq!(translate(pattern, Basic).expect(pattern), expected);
         }
