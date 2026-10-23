@@ -34,10 +34,11 @@ with separate `CARGO_TARGET_DIR` values if you want to keep both binaries.
    meanings. Rust-only syntax must not accidentally become a GNU extension.
 2. `src/matcher/rust_backend.rs` tries `regex-automata` 0.4.18 first. It finds
    the earliest match, then enumerates endpoints with an **anchored**
-   `MatchKind::All` DFA to choose the longest match at that start. Both passes
-   keep the original haystack so assertions retain their context.
+   `MatchKind::All` lazy DFA to choose the longest match at that start. Both
+   passes keep the original haystack so assertions retain their context. Syntax
+   and NFA construction remain eager; DFA transitions are cached as needed.
 3. Patterns requiring backreferences or unsupported DFA assertions, and
-   patterns exceeding the DFA construction limit, use `fancy-regex` 0.19.2.
+   NFAs unable to fit the lazy DFA's minimum cache capacity, use `fancy-regex` 0.19.2.
    A first-match search finds the start; an anchored `leftmost_longest` search
    finds the extent. The whole expression uses this fallback, preserving
    captures and branch relationships.
@@ -66,8 +67,11 @@ reference executable. No GNU implementation source or regex engine is included.
   UTF-8 in the Unicode profile and non-ASCII input in the C profile with status
   2. This avoids exposing those known wrong answers or panics. The separate
   experimental engine patch has not been incorporated or published here.
-- **Resource scope:** the DFA has an 8 MiB size/construction cap. The fallback
-  has a 1,000,000-backtrack limit. `(a|aa)+\1` on 28 `a` bytes exhausts that
+- **Resource scope:** the lazy DFA has an 8 MiB transition-cache capacity;
+  this does not bound total regex/NFA memory. A full cache can clear and rebuild,
+  so cache churn can increase matching cost. This replaces the original eager
+  DFA size/construction caps and can keep more patterns in the regular engine.
+  The fallback has a 1,000,000-backtrack limit. `(a|aa)+\1` on 28 `a` bytes exhausts that
   budget in longest selection; long absent backreference searches can also
   exhaust it. These are errors, never silently treated as nonmatches. Increasing
   the limit does not solve exponential ambiguity.
@@ -186,7 +190,64 @@ exceptions. Their differing machines and compilers make cross-platform timing
 ratios uncontrolled comparisons. These are synthetic warm-cache measurements,
 with raw samples retained and no overall performance score.
 
-The scan results are encouraging, while the new startup/compilation latency is
-a substantive regression. The bounded fallback and Unicode compatibility gaps
-also remain. This supports discussing an experimental feature upstream; these
+At that checked commit, startup/compilation latency was a substantive
+regression despite the scan gains. The local follow-up below addresses much of
+that cost. The bounded fallback and Unicode compatibility gaps remain, so these
 checks do not establish readiness to replace the default backend.
+
+## Local grammar and startup follow-up
+
+Leading BRE `\+`, `\?`, and `\{` are now literal when there is no preceding
+consuming atom, including after assertions and at group/alternative starts.
+Malformed leading intervals remain literal. The CLI tests also retain the
+bracket, one-digit backreference, repeated-quantifier, and buffer-anchor cases
+identified while comparing the adapter with uutils `expr`.
+
+Profiling isolated the bounded Unicode pattern's compilation cost in eager
+full determinization. The longest-match automaton now uses regex-automata's
+lazy DFA with a reusable cache. A mutex keeps each complete overlapping search
+consistent if a compiled pattern is shared between threads. Pattern validation,
+the original-haystack anchoring rule, and status-2 runtime errors remain eager
+or explicit as appropriate; the implementation does not defer malformed-pattern
+diagnostics until input arrives.
+
+The [local macOS report](benchmarks/rust-matcher-lazy-dfa-macos-arm64.json)
+compares the retained eager-DFA Rust binary with the updated Rust binary using
+the same recorded compiler, lockfile, release profile, and nine alternating
+timing rounds after two warmups. This comparison is between two Rust builds;
+the earlier reports compare Rust with Oniguruma. The portable harness now adds
+four bounded-Unicode cases to its original 20, including nonempty input and
+`-o`, to check that the saving persists through actual matching.
+
+| Case | Eager Rust, ms | Lazy Rust, ms |
+| --- | ---: | ---: |
+| Empty input, bounded Unicode expression | 51.15 | 5.20 |
+| Empty input, 128-branch expression | 16.32 | 4.08 |
+| Bounded Unicode expression with short matching input, `-o` | 56.77 | 6.36 |
+| Bounded Unicode expression over 1.32 MB, `-o` | 63.21 | 14.86 |
+| Repeated alternations with `-o`, 1.05 MB | 12.78 | 14.28 |
+
+The startup saving has a throughput tradeoff: the repeated-alternation scan is
+about 12% slower in this run, and the long-line `-o` case is about 9% slower.
+This local run does not establish new Linux or Windows timings. All 24 cases
+retain identical before/after stdout/status. Of those, 22 also agree with GNU;
+the two remaining cases are the unchanged ambiguous-backreference budget and
+high-byte fallback guard. Wrong/error cases receive no speed ratio. There are
+no timeouts or invalid timed samples.
+
+Local checks after the change:
+
+- Default tests: 115 passed; both engines: 169; Rust only: 165.
+- Clippy with warnings denied for all three feature configurations; formatting
+  and diff checks pass.
+- Rust 1.88 checks the Rust-only library and binary without lockfile changes.
+- The 1,159-case adversarial corpus retains the same before/after
+  stdout/status/stderr classifications; the new grammar cases have dedicated
+  CLI regressions. Existing GNU compatibility limits remain.
+- The Rust-only WASIp1 release build succeeds. All 99 previous targeted probes
+  plus eight grammar/Unicode probes have identical native/Wasmtime stdout,
+  stderr, and status. Of these 107 cases, 88 agree with GNU stdout/status;
+  the same 19 documented policy/guard differences remain.
+
+These are local results. The CI run above validates the earlier commit and has
+not been rerun for this follow-up.

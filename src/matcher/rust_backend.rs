@@ -11,14 +11,15 @@ use crate::{Config, RegexMode};
 use fancy_regex::{BytesMode, Regex as FancyRegex, RegexBuilder, RegexInput};
 use regex_automata::{
     Anchored, Input, MatchKind,
-    dfa::{Automaton, OverlappingState, dense},
+    hybrid::dfa::{self, OverlappingState},
     meta,
     nfa::thompson,
     util::syntax,
 };
+use std::sync::Mutex;
 use uucore::error::{UResult, USimpleError};
 
-const DFA_SIZE_LIMIT: usize = 8 * 1024 * 1024;
+const DFA_CACHE_CAPACITY: usize = 8 * 1024 * 1024;
 const BACKTRACK_LIMIT: usize = 1_000_000;
 
 pub(super) struct RustPattern {
@@ -33,7 +34,8 @@ enum Engine {
 
 struct Regular {
     first: meta::Regex,
-    all: dense::DFA<Vec<u32>>,
+    all: dfa::DFA,
+    cache: Mutex<dfa::Cache>,
 }
 
 struct Backtracking {
@@ -112,25 +114,28 @@ impl RustPattern {
                 .syntax(syntax)
                 .build(pattern)
                 .map_err(|e| e.to_string())?;
-            let all = dense::Builder::new()
+            // Validate and compile the NFA now, but construct DFA transitions
+            // only as searches need them. Eager determinization makes bounded
+            // Unicode repetitions expensive even when no input is searched.
+            let all = dfa::Builder::new()
                 .configure(
-                    dense::Config::new()
+                    dfa::Config::new()
                         .match_kind(MatchKind::All)
-                        .dfa_size_limit(Some(DFA_SIZE_LIMIT))
-                        .determinize_size_limit(Some(DFA_SIZE_LIMIT)),
+                        .cache_capacity(DFA_CACHE_CAPACITY),
                 )
                 .syntax(syntax)
                 .thompson(thompson::Config::new().utf8(false))
                 .build(pattern)
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>(Regular { first, all })
+            let cache = Mutex::new(all.create_cache());
+            Ok::<_, String>(Regular { first, all, cache })
         };
 
         let engine = if let Ok(regular) = regular() {
             Engine::Regular(Box::new(regular))
         } else {
-            // This includes backreferences and regexes whose DFA exceeds the
-            // compilation budget. It never falls back to Oniguruma.
+            // This includes backreferences and assertions or NFAs unsupported
+            // by the lazy DFA. It never falls back to Oniguruma.
             let make = |longest| {
                 RegexBuilder::new(pattern)
                     .bytes_mode(if profile.unicode() {
@@ -192,10 +197,14 @@ impl RustPattern {
                     .anchored(Anchored::Yes);
                 let mut state = OverlappingState::start();
                 let mut longest = None;
+                let mut cache = regular
+                    .cache
+                    .lock()
+                    .map_err(|_| error("regular matcher cache was poisoned"))?;
                 loop {
                     regular
                         .all
-                        .try_search_overlapping_fwd(&input, &mut state)
+                        .try_search_overlapping_fwd(&mut cache, &input, &mut state)
                         .map_err(|e| error(format!("match failed: {e}")))?;
                     let Some(found) = state.get_match() else {
                         return Ok(longest);
@@ -342,6 +351,25 @@ mod tests {
         assert_eq!(pattern.search_leftmost(b"zaab", 0).unwrap(), Some((1, 2)));
         assert_eq!(pattern.longest_end_at(b"zaab", 1).unwrap(), Some(3));
         assert_eq!(pattern.search_leftmost(b"zaab", 2).unwrap(), Some((2, 3)));
+    }
+
+    #[test]
+    fn bounded_unicode_repetitions_use_the_regular_engine() {
+        let pattern = compile(r"\w{3,12}_(a|b)", TextProfile::Unicode);
+        assert!(matches!(pattern.engine, Engine::Regular(_)));
+        for line in ["!Δelta_a?", "!Привет_b?"] {
+            let start = 1;
+            let end = line.len() - 1;
+            assert_eq!(
+                pattern.search_leftmost(line.as_bytes(), 0).unwrap(),
+                Some((start, end)),
+            );
+            assert_eq!(
+                pattern.longest_end_at(line.as_bytes(), start).unwrap(),
+                Some(end),
+            );
+        }
+        assert_eq!(pattern.longest_end_at(b"!ab_a?", 1).unwrap(), None);
     }
 
     #[test]

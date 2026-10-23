@@ -43,6 +43,8 @@ def corpus():
         "backref-absent": b"x" * 1024 + b"\n",
         "high-bytes": bytes([0xE2, 0x82, 0x62, 0x0A]) * 10_000,
         "guarded-backref": "é abab\n".encode(),
+        "bounded-short": "Δelta_a\nПривет_b\nno-match\n".encode(),
+        "bounded-scan": "Δelta_a\nПривет_b\nno-match\n".encode() * 40_000,
     }
 
 
@@ -72,6 +74,10 @@ def cases():
         ("backref-absent", "backref-absent", "C", ["-aEo", r"(ab)+\1"]),
         ("byte-class-count", "high-bytes", "C", ["-aEc", "[[:alpha:]]"]),
         ("backref-high-byte-guard", "guarded-backref", "C", ["-aEo", r"(ab)\1"]),
+        ("startup-unicode-only-matching", "empty", "C.UTF-8", ["-aEo", r"\w{3,12}_(a|b)"]),
+        ("bounded-unicode-short", "bounded-short", "C.UTF-8", ["-aEo", r"\w{3,12}_(a|b)"]),
+        ("bounded-unicode-count", "bounded-scan", "C.UTF-8", ["-aEc", r"\w{3,12}_(a|b)"]),
+        ("bounded-unicode-only-matching", "bounded-scan", "C.UTF-8", ["-aEo", r"\w{3,12}_(a|b)"]),
     ]
 
 
@@ -138,7 +144,7 @@ def run(options):
         "rustc": options.rustc,
         "harness_sha256": sha256(Path(__file__).read_bytes()),
         "cargo_lock_sha256": sha256((Path(__file__).resolve().parents[2] / "Cargo.lock").read_bytes()),
-        "profile": "cargo build --locked --release; default vs --features rust-matcher",
+        "profile": options.profile_description,
         "measurement": "subprocess wall milliseconds; warm page cache; stdout -> null, stderr collected and discarded; includes process startup, regex compilation, input reading, matching and output generation",
         "rounds": options.rounds,
         "warmups": options.warmups,
@@ -227,6 +233,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, help="Default-Oniguruma release binary")
     parser.add_argument("--candidate", required=True, help="Same source/profile, release binary with rust-matcher enabled")
+    parser.add_argument("--profile-description", default="cargo build --locked --release; default vs --features rust-matcher",
+                        help="Build configurations being compared, recorded in the report")
     parser.add_argument("--gnu", help="Optional GNU grep executable, used only as a black-box reference")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-commit", required=True)

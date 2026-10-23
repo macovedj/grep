@@ -118,3 +118,22 @@ exhaustive performance or compatibility suite. They do not establish that the
 Rust backend is ready to become the default, nor that the observed ratios
 generalize to Linux, Windows or WASI. The CI benchmark job publishes a separate
 Linux report for comparison instead of treating these local numbers as portable.
+
+## Lazy-DFA follow-up
+
+The [follow-up report](../../docs/benchmarks/rust-matcher-lazy-dfa-macos-arm64.json)
+compares two Rust-matcher release builds: the retained eager-DFA binary and the
+local lazy-DFA change. Both use the recorded 1.98 nightly, lockfile, and fat-LTO
+profile. Pass `--profile-description` to record these different build roles.
+
+The harness now includes four additional bounded-Unicode cases, covering empty
+input with `-o`, short matching input, and a 1.32 MB count/`-o` workload. These
+check that reducing compilation cost benefits commands that actually match.
+The original reports above retain their original 20 cases and source hashes.
+
+In this local follow-up, bounded-Unicode empty-input startup falls from 51.15 ms
+to 5.20 ms; the matching 1.32 MB `-o` case falls from 63.21 ms to 14.86 ms.
+There are throughput tradeoffs: repeated alternations with `-o` increase from
+12.78 ms to 14.28 ms, and the long-line `-o` case increases from 3.68 ms to
+4.00 ms. All raw samples are retained. These remain local measurements;
+updated Linux/Windows timing has not been collected.
