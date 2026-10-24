@@ -6,11 +6,12 @@ The default build still uses Oniguruma. Enabling `rust-matcher` switches
 retains the existing `-P` implementation. This is an initial integration, not a
 proposal to change the default or a complete GNU compatibility claim.
 
-This local byte-integration branch additionally overrides `fancy-regex` with
-the adjacent `../fancy-regex-byte-fix` checkout. It must be present to build.
-That checkout is based on upstream `d18bf81b6d796d3d60674f3ef4a7d7fa8763bdc0`
-plus local commits `6c903f7` (case-insensitive byte boundaries) and `e812cbf`
-(UnicodeBytes VM traversal and scalar consumption). The sibling override is
+This byte-integration review branch additionally overrides `fancy-regex` with
+the pinned commit `e812cbff72bfb087cfd38f5d4e0f9d477c4c17c5` in
+[`macovedj/fancy-regex`](https://github.com/macovedj/fancy-regex/commit/e812cbff72bfb087cfd38f5d4e0f9d477c4c17c5).
+That commit is based on upstream `d18bf81b6d796d3d60674f3ef4a7d7fa8763bdc0`
+plus commits `6c903f7` (case-insensitive byte boundaries) and `e812cbf`
+(UnicodeBytes VM traversal and scalar consumption). The Git override is
 qualification infrastructure; replace it with a released engine dependency
 before proposing this grep integration upstream. Version `0.19.2` alone does
 not identify these sources: upstream main and the older published crate both
@@ -71,7 +72,7 @@ reference executable. No GNU implementation source or regex engine is included.
   produce an unsupported diagnostic. This does not implement libc collation,
   locale-specific case folding, or GNU Unicode character classes. POSIX classes
   retain Rust's ASCII membership; Unicode word classes retain Rust's membership.
-- **Byte-engine dependency:** with the local engine override above, the
+- **Byte-engine dependency:** with the pinned engine override above, the
   fallback no longer blanket-rejects C-locale high bytes or malformed UTF-8.
   Search recovery steps over malformed bytes; Unicode consuming dots still
   require valid scalars. C mode retains raw-byte matching. Case-insensitive
@@ -100,7 +101,7 @@ reference executable. No GNU implementation source or regex engine is included.
   including longest selection of lazy expressions. A Rust-only build has no
   PCRE replacement.
 
-The local engine checkout is an experimental dependency until suitable engine
+The pinned engine fork is an experimental dependency until suitable engine
 changes are released. Remaining class, word, resource, and command gaps still
 need work before considering a default switch. No devenv package, registry,
 or production configuration is changed.
@@ -313,5 +314,7 @@ they do not isolate the cost of either local engine commit or establish a
 general speedup. The earlier startup/scan tradeoffs remain relevant.
 
 The earlier benchmark and CI records above apply to their recorded commits.
-These byte changes have been qualified locally and have not been published or
-run through GitHub CI.
+These byte changes were qualified locally before publishing review branches.
+The reviewed engine source is unchanged by replacing the local path override
+with its exact Git commit. Updated GitHub CI results must be checked separately;
+no upstream PR has been opened.

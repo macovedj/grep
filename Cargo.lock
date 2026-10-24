@@ -433,6 +433,7 @@ dependencies = [
 [[package]]
 name = "fancy-regex"
 version = "0.19.2"
+source = "git+https://github.com/macovedj/fancy-regex.git?rev=e812cbff72bfb087cfd38f5d4e0f9d477c4c17c5#e812cbff72bfb087cfd38f5d4e0f9d477c4c17c5"
 dependencies = [
  "bit-set",
  "regex-automata",

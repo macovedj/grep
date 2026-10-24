@@ -61,7 +61,7 @@ codegen-units = 1
 [profile.dist]
 inherits = "release"
 
-# Local qualification only. Replace with a released engine dependency before
+# Review qualification only. Replace with a released engine dependency before
 # proposing the grep integration upstream; see docs/rust-matcher-preview.md.
 [patch.crates-io]
-fancy-regex = { path = "../fancy-regex-byte-fix" }
+fancy-regex = { git = "https://github.com/macovedj/fancy-regex.git", rev = "e812cbff72bfb087cfd38f5d4e0f9d477c4c17c5" }
