@@ -16,6 +16,16 @@ fn ucmd() -> (TestScenario, UCommand) {
 }
 
 #[test]
+fn invalid_perl_engine_spans_are_reported_before_reaching_output() {
+    let (_scene, mut cmd) = ucmd();
+    cmd.args(&["-P", "-a", "-o", "-b", r"\w"])
+        .env("LC_ALL", "C")
+        .pipe_in(&b"(\xa1\xaf(\x7f\xafa\xff\xe2(\xc0\xc3 \xffb\n\xed\n"[..])
+        .fails_with_code(2)
+        .stderr_contains("matcher returned a span outside the input");
+}
+
+#[test]
 fn bre_default_metacharacters() {
     // BRE: . * ^ $ [] [^] and literal +, |, (, )
     let cases: &[(&str, &str, &str)] = &[

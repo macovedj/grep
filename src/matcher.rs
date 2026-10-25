@@ -277,15 +277,32 @@ impl CompiledPattern {
     }
 
     fn search_leftmost(&self, line: &[u8], offset: usize) -> UResult<Option<(usize, usize)>> {
-        match self {
-            Self::Onig(pattern) => Ok(pattern.search_leftmost(line, offset)),
+        let found = match self {
+            Self::Onig(pattern) => pattern.search_leftmost(line, offset),
+        };
+        // Every backend must preserve original byte offsets and stay within
+        // the input. In particular, a malformed-byte Onig match must never
+        // reach the output code with an out-of-bounds capture.
+        if found.is_some_and(|(start, end)| start < offset || start > end || end > line.len()) {
+            return Err(USimpleError::new(
+                2,
+                "matcher returned a span outside the input",
+            ));
         }
+        Ok(found)
     }
 
     fn longest_end_at(&self, line: &[u8], start: usize) -> UResult<Option<usize>> {
-        match self {
-            Self::Onig(pattern) => Ok(pattern.longest_end_at(line, start)),
+        let end = match self {
+            Self::Onig(pattern) => pattern.longest_end_at(line, start),
+        };
+        if end.is_some_and(|end| end < start || end > line.len()) {
+            return Err(USimpleError::new(
+                2,
+                "matcher returned a span outside the input",
+            ));
         }
+        Ok(end)
     }
 
     fn is_match(&self, line: &[u8]) -> UResult<bool> {
