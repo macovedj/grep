@@ -62,11 +62,16 @@ impl<'a> Matcher<'a> {
     }
 
     /// Decide whether `line` matches and return the positions to highlight.
-    pub fn match_line(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn match_line(&self, line: &[u8]) -> UResult<Option<Vec<(usize, usize)>>> {
         let mut any_seen = false;
         let mut any_selected = false;
-        let positions: Vec<_> = MatchIter::new(&self.patterns, line)
-            .filter(|&(start, end)| {
+        let positions: Vec<_> = MatchIter::new(&self.patterns, line)?
+            .filter(|result| {
+                // Keep errors so collect can propagate them.
+                let (start, end) = match result {
+                    Ok(span) => *span,
+                    Err(_) => return true,
+                };
                 any_seen = true;
                 // Drop matches that don't span the whole line if `-x` was requested.
                 if self.config.line_regexp && !(start == 0 && end == line.len()) {
@@ -83,7 +88,7 @@ impl<'a> Matcher<'a> {
                 }
                 true
             })
-            .collect();
+            .collect::<UResult<_>>()?;
 
         let raw_matched = if self.config.line_regexp || self.config.word_regexp {
             // -w / -x are authoritative once matches are filtered. Zero-length
@@ -93,23 +98,29 @@ impl<'a> Matcher<'a> {
             any_seen
         };
 
-        if raw_matched != self.config.invert_match {
+        Ok(if raw_matched != self.config.invert_match {
             Some(positions)
         } else {
             None
-        }
+        })
     }
 
     /// Cheap match check that doesn't enumerate positions.
-    pub fn is_match(&self, line: &[u8]) -> Option<Vec<(usize, usize)>> {
+    pub fn is_match(&self, line: &[u8]) -> UResult<Option<Vec<(usize, usize)>>> {
         // `-w` / `-x` need positions to filter, so we fall back to `match_line`.
         let matched = if self.config.line_regexp || self.config.word_regexp {
-            self.match_line(line).is_some()
+            self.match_line(line)?.is_some()
         } else {
-            let raw_matched = self.patterns.iter().any(|p| p.is_match(line));
+            let mut raw_matched = false;
+            for p in &self.patterns {
+                if p.is_match(line)? {
+                    raw_matched = true;
+                    break;
+                }
+            }
             raw_matched != self.config.invert_match
         };
-        matched.then(Vec::new)
+        Ok(matched.then(Vec::new))
     }
 
     /// Word-boundary check `-w`.
@@ -151,8 +162,8 @@ struct MatchIter<'a> {
 }
 
 impl<'a> MatchIter<'a> {
-    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> Self {
-        Self {
+    fn new(patterns: &'a [CompiledPattern], line: &'a [u8]) -> UResult<Self> {
+        Ok(Self {
             cursors: patterns
                 .iter()
                 .map(|pattern| {
@@ -162,24 +173,26 @@ impl<'a> MatchIter<'a> {
                         offset: 0,
                         pending: None,
                     };
-                    c.refill();
-                    c
+                    c.refill()?;
+                    Ok(c)
                 })
-                .collect(),
+                .collect::<UResult<Vec<_>>>()?,
             last_end: 0,
-        }
+        })
     }
 }
 
 impl<'a> Iterator for MatchIter<'a> {
-    type Item = (usize, usize);
+    type Item = UResult<(usize, usize)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Discard stale pendings that fall before the last emit.
         for cursor in &mut self.cursors {
             if matches!(cursor.pending, Some((s, _)) if s < self.last_end) {
                 cursor.offset = self.last_end;
-                cursor.refill();
+                if let Err(error) = cursor.refill() {
+                    return Some(Err(error));
+                }
             }
         }
 
@@ -195,9 +208,10 @@ impl<'a> Iterator for MatchIter<'a> {
             .map(|(i, _)| i)?;
 
         let (start, end) = self.cursors[best_idx].pending.unwrap();
-        self.cursors[best_idx].refill();
-        self.last_end = end;
-        Some((start, end))
+        Some(self.cursors[best_idx].refill().map(|()| {
+            self.last_end = end;
+            (start, end)
+        }))
     }
 }
 
@@ -212,24 +226,25 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn refill(&mut self) {
+    fn refill(&mut self) -> UResult<()> {
         if self.offset > self.line.len() {
             self.pending = None;
-            return;
+            return Ok(());
         }
-        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)
+        let Some((start, leftmost_end)) = self.pattern.search_leftmost(self.line, self.offset)?
         else {
             self.pending = None;
-            return;
+            return Ok(());
         };
         let end = self
             .pattern
-            .longest_end_at(self.line, start)
+            .longest_end_at(self.line, start)?
             .unwrap_or(leftmost_end);
         // Advance the next search past the match we just found.
         // Zero-length matches need a +1 nudge to avoid spinning forever.
         self.offset = end.max(start + 1);
         self.pending = Some((start, end));
+        Ok(())
     }
 }
 
@@ -261,21 +276,21 @@ impl CompiledPattern {
         OnigPattern::compile(pattern, config).map(Self::Onig)
     }
 
-    fn search_leftmost(&self, line: &[u8], offset: usize) -> Option<(usize, usize)> {
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> UResult<Option<(usize, usize)>> {
         match self {
-            Self::Onig(pattern) => pattern.search_leftmost(line, offset),
+            Self::Onig(pattern) => Ok(pattern.search_leftmost(line, offset)),
         }
     }
 
-    fn longest_end_at(&self, line: &[u8], start: usize) -> Option<usize> {
+    fn longest_end_at(&self, line: &[u8], start: usize) -> UResult<Option<usize>> {
         match self {
-            Self::Onig(pattern) => pattern.longest_end_at(line, start),
+            Self::Onig(pattern) => Ok(pattern.longest_end_at(line, start)),
         }
     }
 
-    fn is_match(&self, line: &[u8]) -> bool {
+    fn is_match(&self, line: &[u8]) -> UResult<bool> {
         match self {
-            Self::Onig(pattern) => pattern.is_match(line),
+            Self::Onig(pattern) => Ok(pattern.is_match(line)),
         }
     }
 }
