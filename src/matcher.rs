@@ -18,6 +18,8 @@ static ONIG_NEW_MUTEX: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod gnu_syntax;
+#[cfg(all(test, feature = "rust-matcher"))]
+mod rust_backend;
 
 pub struct Matcher<'a> {
     config: &'a Config<'a>,
