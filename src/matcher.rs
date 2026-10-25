@@ -5,20 +5,26 @@
 
 use crate::{Config, RegexMode};
 use memchr::memmem;
+#[cfg(feature = "onig")]
 use onig::{RegexOptions, Region, SearchOptions, Syntax, SyntaxBehavior, SyntaxOperator};
+#[cfg(feature = "onig")]
 use onig_sys::{
     ONIGERR_EMPTY_RANGE_IN_CHAR_CLASS, OnigEncCtype_ONIGENC_CTYPE_WORD, OnigEncodingUTF8,
 };
+#[cfg(feature = "onig")]
 use std::ptr::{null, null_mut};
+#[cfg(feature = "onig")]
 use std::sync::Mutex;
 use uucore::error::{UResult, USimpleError};
+#[cfg(feature = "onig")]
 use uucore::show_warning;
 
+#[cfg(feature = "onig")]
 static ONIG_NEW_MUTEX: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
+#[cfg(any(feature = "rust-matcher", test))]
 mod gnu_syntax;
-#[cfg(all(test, feature = "rust-matcher"))]
+#[cfg(feature = "rust-matcher")]
 mod rust_backend;
 
 pub struct Matcher<'a> {
@@ -83,7 +89,7 @@ impl<'a> Matcher<'a> {
                     return false;
                 }
                 // Drop matches that aren't word matches if `-w` was requested.
-                if self.config.word_regexp && !Self::is_word_match(line, start, end) {
+                if self.config.word_regexp && !self.is_word_match(line, start, end) {
                     return false;
                 }
                 any_selected = true;
@@ -131,7 +137,23 @@ impl<'a> Matcher<'a> {
     /// Word-boundary check `-w`.
     /// NOTE that `-w` does not check both sides, unlike `\b` in a regex.
     /// Start/End-of-line count as non-words.
-    fn is_word_match(line: &[u8], start: usize, end: usize) -> bool {
+    fn is_word_match(&self, line: &[u8], start: usize, end: usize) -> bool {
+        #[cfg(feature = "rust-matcher")]
+        if let Some(CompiledPattern::Rust(pattern)) = self.patterns.first() {
+            return pattern.is_word_match(line, start, end);
+        }
+        #[cfg(feature = "onig")]
+        {
+            Self::onig_word_match(line, start, end)
+        }
+        #[cfg(not(feature = "onig"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "onig")]
+    fn onig_word_match(line: &[u8], start: usize, end: usize) -> bool {
         // SAFETY: This code uses OnigEncodingType such that it can support other types of encodings in the future.
         unsafe {
             let mbc_to_code = OnigEncodingUTF8.mbc_to_code.unwrap_unchecked();
@@ -273,17 +295,37 @@ fn plain_literal(pattern: &str, ignore_case: bool, mode: RegexMode) -> Option<Ve
 }
 
 enum CompiledPattern {
+    #[cfg(feature = "onig")]
     Onig(OnigPattern),
+    #[cfg(feature = "rust-matcher")]
+    Rust(rust_backend::RustPattern),
 }
 
 impl CompiledPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
-        OnigPattern::compile(pattern, config).map(Self::Onig)
+        #[cfg(feature = "rust-matcher")]
+        if config.regex_mode != RegexMode::Perl {
+            return rust_backend::RustPattern::compile(pattern, config).map(Self::Rust);
+        }
+        #[cfg(feature = "onig")]
+        {
+            OnigPattern::compile(pattern, config).map(Self::Onig)
+        }
+        #[cfg(not(feature = "onig"))]
+        {
+            Err(USimpleError::new(
+                2,
+                "-P requires the onig feature in this experimental build",
+            ))
+        }
     }
 
     fn search_leftmost(&self, line: &[u8], offset: usize) -> UResult<Option<(usize, usize)>> {
         let found = match self {
+            #[cfg(feature = "onig")]
             Self::Onig(pattern) => pattern.search_leftmost(line, offset),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.search_leftmost(line, offset)?,
         };
         // Every backend must preserve original byte offsets and stay within
         // the input. In particular, a malformed-byte Onig match must never
@@ -299,7 +341,10 @@ impl CompiledPattern {
 
     fn longest_end_at(&self, line: &[u8], start: usize) -> UResult<Option<usize>> {
         let end = match self {
+            #[cfg(feature = "onig")]
             Self::Onig(pattern) => pattern.longest_end_at(line, start),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.longest_end_at(line, start)?,
         };
         if end.is_some_and(|end| end < start || end > line.len()) {
             return Err(USimpleError::new(
@@ -312,11 +357,15 @@ impl CompiledPattern {
 
     fn is_match(&self, line: &[u8]) -> UResult<bool> {
         match self {
+            #[cfg(feature = "onig")]
             Self::Onig(pattern) => Ok(pattern.is_match(line)),
+            #[cfg(feature = "rust-matcher")]
+            Self::Rust(pattern) => pattern.is_match(line),
         }
     }
 }
 
+#[cfg(feature = "onig")]
 struct OnigPattern {
     /// Default semantics. It's decently fast and used for searching.
     leftmost: OnigRegex,
@@ -326,6 +375,7 @@ struct OnigPattern {
     longest_anchored: OnigRegex,
 }
 
+#[cfg(feature = "onig")]
 impl OnigPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
         let mut syntax = *match config.regex_mode {
@@ -437,17 +487,21 @@ impl OnigPattern {
     }
 }
 
+#[cfg(feature = "onig")]
 struct OnigRegex {
     raw: onig_sys::OnigRegex,
 }
 
 // SAFETY: Oniguruma compiled regexes are immutable after construction, and this
 // wrapper owns and frees the raw pointer exactly once. This mirrors `onig::Regex`.
+#[cfg(feature = "onig")]
 unsafe impl Send for OnigRegex {}
 // SAFETY: Searches only read the compiled regex. Capture storage is caller-owned
 // through `Region`, so sharing the compiled regex across threads is safe.
+#[cfg(feature = "onig")]
 unsafe impl Sync for OnigRegex {}
 
+#[cfg(feature = "onig")]
 impl OnigRegex {
     fn compile(pattern: &str, syntax: &Syntax, options: RegexOptions) -> Result<Self, OnigError> {
         let pattern = pattern.as_bytes();
@@ -533,6 +587,7 @@ impl OnigRegex {
     }
 }
 
+#[cfg(feature = "onig")]
 impl Drop for OnigRegex {
     fn drop(&mut self) {
         // SAFETY: `raw` was returned by a successful `onig_new_deluxe` call and
@@ -541,11 +596,13 @@ impl Drop for OnigRegex {
     }
 }
 
+#[cfg(feature = "onig")]
 struct OnigError {
     code: i32,
     message: String,
 }
 
+#[cfg(feature = "onig")]
 impl OnigError {
     fn new(code: i32, info: *const onig_sys::OnigErrorInfo) -> Self {
         Self {
@@ -555,12 +612,14 @@ impl OnigError {
     }
 }
 
+#[cfg(feature = "onig")]
 fn region_ptr(region: Option<&mut Region>) -> *mut onig_sys::OnigRegion {
     region.map_or(null_mut(), |r| {
         r as *mut Region as *mut onig_sys::OnigRegion
     })
 }
 
+#[cfg(feature = "onig")]
 fn onig_match_result(result: i32) -> Option<usize> {
     if result >= 0 {
         Some(result as usize)
@@ -574,12 +633,14 @@ fn onig_match_result(result: i32) -> Option<usize> {
     }
 }
 
+#[cfg(feature = "onig")]
 fn onig_error_message(code: i32, info: *const onig_sys::OnigErrorInfo) -> String {
     let mut buff = [0; onig_sys::ONIG_MAX_ERROR_MESSAGE_LEN as usize];
     let len = unsafe { onig_sys::onig_error_code_to_str(buff.as_mut_ptr(), code, info) };
     String::from_utf8_lossy(&buff[..len as usize]).into_owned()
 }
 
+#[cfg(feature = "onig")]
 fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> {
     match pattern.as_bytes().first()? {
         b'?' => Some(("?", &pattern[1..])),
@@ -590,6 +651,7 @@ fn strip_leading_repeat_operator(pattern: &str) -> Option<(&'static str, &str)> 
     }
 }
 
+#[cfg(feature = "onig")]
 fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
     let close = pattern.as_bytes().iter().position(|&b| b == b'}')?;
     let body = &pattern[1..close];
@@ -604,6 +666,7 @@ fn strip_leading_interval_repeat(pattern: &str) -> Option<&str> {
 /// those: a bracket whose first and last characters are colons, that holds at
 /// least one other character, and that contains no range, class, equivalence
 /// class or collating element.
+#[cfg(feature = "onig")]
 fn has_confusing_bracket(pattern: &[u8]) -> bool {
     let mut i = 0;
     while i < pattern.len() {
@@ -625,6 +688,7 @@ fn has_confusing_bracket(pattern: &[u8]) -> bool {
 /// Scan the body of a bracket expression starting at `start` (just past the
 /// `[`). Returns whether it is a misspelled character class and the index just
 /// past its closing `]`.
+#[cfg(feature = "onig")]
 fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
     const FIRST_IS_COLON: u8 = 1;
     const LAST_IS_COLON: u8 = 2;
@@ -675,6 +739,7 @@ fn scan_bracket(pattern: &[u8], start: usize) -> (bool, usize) {
 
 /// Index just past the `:]`, `.]` or `=]` closing a `[: [. [=` subexpression
 /// whose body starts at `start`.
+#[cfg(feature = "onig")]
 fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Option<usize> {
     (start..pattern.len().saturating_sub(1))
         .find(|&i| pattern[i] == delimiter && pattern[i + 1] == b']')
@@ -683,7 +748,9 @@ fn find_bracket_subexpr_end(pattern: &[u8], start: usize, delimiter: u8) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{has_confusing_bracket, plain_literal};
+    #[cfg(feature = "onig")]
+    use super::has_confusing_bracket;
+    use super::plain_literal;
     use crate::RegexMode;
 
     fn lit(p: &str, ic: bool, mode: RegexMode) -> Option<Vec<u8>> {
@@ -726,6 +793,7 @@ mod tests {
         assert_eq!(lit("naïve", false, RegexMode::Basic), None);
     }
 
+    #[cfg(feature = "onig")]
     #[test]
     fn detects_misspelled_character_classes() {
         for p in [
@@ -740,6 +808,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "onig")]
     #[test]
     fn accepts_bracket_expressions_that_are_not_confusing() {
         for p in [

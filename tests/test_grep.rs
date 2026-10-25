@@ -15,6 +15,7 @@ fn ucmd() -> (TestScenario, UCommand) {
     (scene, cmd)
 }
 
+#[cfg(feature = "onig")]
 #[test]
 fn invalid_perl_engine_spans_are_reported_before_reaching_output() {
     let (_scene, mut cmd) = ucmd();
@@ -413,6 +414,7 @@ fn conflicting_matcher_flags_are_rejected() {
         .stdout_only("abc\n");
 }
 
+#[cfg(feature = "onig")]
 #[test]
 fn pcre_features() {
     let (_s, mut c) = ucmd();
@@ -454,12 +456,15 @@ fn perl_regexp_rejects_multiple_patterns() {
         .fails_with_code(2)
         .stderr_contains("the -P option only supports a single pattern");
 
-    // A single pattern with -P must still work normally.
-    let (_s, mut c) = ucmd();
-    c.args(&["-P", "-e", r"\d+"])
-        .pipe_in("abc\n42\n")
-        .succeeds()
-        .stdout_only("42\n");
+    #[cfg(feature = "onig")]
+    {
+        // A single pattern with -P must still work normally.
+        let (_s, mut c) = ucmd();
+        c.args(&["-P", "-e", r"\d+"])
+            .pipe_in("abc\n42\n")
+            .succeeds()
+            .stdout_only("42\n");
+    }
 }
 
 #[test]
@@ -1834,19 +1839,22 @@ fn null_data_mode_records() {
         .succeeds()
         .stdout_is_bytes(b"a\0\n\0b\0");
 
-    // GNU grep's PCRE path currently does not let `.*` consume the extra
-    // newline here under -z; this mirrors the GNU pcre-context test.
-    let (_s, mut c) = ucmd();
-    c.args(&["-P", "-z", "-o", r"(?<=\n\n\n).*"])
-        .pipe_in(
-            &b"NUL preceded by 0 empty lines.\0\
-              \nNUL preceded by 1 empty line.\0\
-              \n\nNUL preceded by 2 empty lines.\0\
-              \n\n\nNUL preceded by 3 empty lines.\0\
-              \n\n\n\nNUL preceded by 4 empty lines.\0\n"[..],
-        )
-        .succeeds()
-        .stdout_is_bytes(b"NUL preceded by 3 empty lines.\0NUL preceded by 4 empty lines.\0");
+    #[cfg(feature = "onig")]
+    {
+        // GNU grep's PCRE path currently does not let `.*` consume the extra
+        // newline here under -z; this mirrors the GNU pcre-context test.
+        let (_s, mut c) = ucmd();
+        c.args(&["-P", "-z", "-o", r"(?<=\n\n\n).*"])
+            .pipe_in(
+                &b"NUL preceded by 0 empty lines.\0\
+                  \nNUL preceded by 1 empty line.\0\
+                  \n\nNUL preceded by 2 empty lines.\0\
+                  \n\n\nNUL preceded by 3 empty lines.\0\
+                  \n\n\n\nNUL preceded by 4 empty lines.\0\n"[..],
+            )
+            .succeeds()
+            .stdout_is_bytes(b"NUL preceded by 3 empty lines.\0NUL preceded by 4 empty lines.\0");
+    }
 
     // Counting works under -z.
     let (_s, mut c) = ucmd();

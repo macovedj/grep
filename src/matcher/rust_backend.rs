@@ -7,7 +7,7 @@
 //! locale profile deliberately define a narrower contract than GNU grep.
 
 use super::gnu_syntax;
-use crate::RegexMode;
+use crate::{Config, RegexMode};
 use fancy_regex::{BytesMode, Regex as FancyRegex, RegexBuilder, RegexInput};
 use regex_automata::{
     Anchored, Input, MatchKind,
@@ -79,6 +79,22 @@ impl TextProfile {
         });
         !before.is_some_and(regex_syntax::is_word_character)
             && !after.is_some_and(regex_syntax::is_word_character)
+    }
+
+    fn from_environment() -> UResult<Self> {
+        // POSIX precedence ignores empty variables. Read once at compilation,
+        // rather than making the meaning of a compiled regex change mid-search.
+        let name = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .find(|value| !value.is_empty());
+        match name {
+            None => Ok(Self::Ascii),
+            Some(name) => name.to_str().map_or_else(
+                || Err(error("locale name must be valid UTF-8")),
+                Self::from_name,
+            ),
+        }
     }
 
     fn from_name(name: &str) -> UResult<Self> {
@@ -179,6 +195,16 @@ impl Regular {
 }
 
 impl RustPattern {
+    pub(super) fn compile(pattern: &str, config: &Config<'_>) -> UResult<Self> {
+        let profile = TextProfile::from_environment()?;
+        let translated = if config.regex_mode == RegexMode::Fixed {
+            escape_literal(pattern, profile)
+        } else {
+            translate_for_profile(pattern, config.regex_mode, profile)?
+        };
+        Self::compile_translated(&translated, profile, config.ignore_case, config.null_data)
+    }
+
     fn compile_translated(
         pattern: &str,
         profile: TextProfile,
