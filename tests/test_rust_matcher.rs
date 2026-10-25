@@ -222,3 +222,81 @@ fn unterminated_bracket_ranges_are_invalid_patterns() {
         }
     }
 }
+
+#[test]
+fn bre_repetitions_and_backreferences_do_not_acquire_rust_syntax() {
+    assert_output("C", &["-o", r"x\+\?y"], b"y\nxxy\n", b"y\nxxy\n", 0);
+    assert_output("C", &["-o", r"\(a\)\10"], b"aa0\naa1\n", b"aa0\n", 0);
+}
+
+#[test]
+fn backreferences_keep_original_byte_offsets() {
+    assert_output(
+        "C",
+        &["-bo", r"\(ab\)\1"],
+        b"zabab\nxxabab\n",
+        b"1:abab\n8:abab\n",
+        0,
+    );
+    assert_output("C", &["-Ebo", r"(a|ab)\1"], b"zabab\n", b"1:abab\n", 0);
+}
+
+#[test]
+fn backreferences_require_a_closed_group_in_the_current_branch() {
+    for args in [
+        &["-Eo", r"(a)|\1"][..],
+        &["-Eo", r"(a)|(b)\1"][..],
+        &["-Eo", r"(a\1)"][..],
+        &["-Eo", r"\1(a)"][..],
+        &["-o", r"\(a\)\|\1"][..],
+    ] {
+        let output = grep("C", args, b"aa bb\n");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid back reference"));
+    }
+    assert_output("C", &["-Eo", r"((a)|(b))\2"], b"aa bb\n", b"aa\n", 0);
+}
+
+#[test]
+fn backtracking_limit_is_an_error_instead_of_a_nonmatch() {
+    // A short ambiguous backreference is enough to exceed the fallback's
+    // bounded search. It must not silently change the command's answer to 1.
+    let mut input = vec![b'a'; 28];
+    input.push(b'\n');
+    let output = grep("C", &["-Eo", r"(a|aa)+\1"], &input);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("backtrack") || stderr.contains("limit"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn malformed_utf8_on_the_backreference_fallback_is_an_explicit_error() {
+    // The experimental fallback deliberately refuses malformed UTF-8 until
+    // its byte-search fixes can be supplied by an upstream engine release.
+    let output = grep("C.UTF-8", &["-aEo", r"(a)\1"], b"\xffaa\n");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("utf-8") || stderr.contains("utf8"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn non_ascii_bytes_on_the_c_locale_backreference_fallback_are_an_error() {
+    // The stock fallback also has byte-mode backreference gaps. Refusing this
+    // input preserves an explicit limitation instead of reporting no match.
+    let output = grep("C", &["-ao", r"^\(.\)\1$"], b"\x80\x80\n");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        stderr.contains("ascii") || stderr.contains("byte"),
+        "{stderr}"
+    );
+}
