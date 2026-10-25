@@ -1,0 +1,139 @@
+name: Rust matcher
+
+on:
+  push:
+    paths:
+      - .github/workflows/rust-matcher.yml
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+  pull_request:
+    paths:
+      - .github/workflows/rust-matcher.yml
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  stable:
+    name: Stable (${{ matrix.os }}, ${{ matrix.backend.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        backend:
+          - name: onig
+            cargo-args: ""
+          - name: onig-and-rust
+            cargo-args: --features rust-matcher
+          - name: rust-only
+            cargo-args: --no-default-features --features rust-matcher
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose | tee toolchain.log
+          cargo --version | tee -a toolchain.log
+      - name: Build
+        run: cargo build --locked ${{ matrix.backend.cargo-args }} 2>&1 | tee build.log
+      - name: Test
+        run: cargo test --locked ${{ matrix.backend.cargo-args }} 2>&1 | tee test.log
+      - name: Clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.backend.cargo-args }} -- -D warnings 2>&1 | tee clippy.log
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stable-${{ matrix.os }}-${{ matrix.backend.name }}
+          path: "*.log"
+          if-no-files-found: ignore
+          retention-days: 14
+
+  msrv:
+    name: Rust 1.88 (${{ matrix.backend.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - name: onig
+            cargo-args: ""
+          - name: onig-and-rust
+            cargo-args: --features rust-matcher
+          - name: rust-only
+            cargo-args: --no-default-features --features rust-matcher
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose | tee toolchain.log
+          cargo --version | tee -a toolchain.log
+      - name: Check all targets at the declared minimum Rust version
+        run: cargo check --locked --all-targets ${{ matrix.backend.cargo-args }} 2>&1 | tee msrv.log
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msrv-${{ matrix.backend.name }}
+          path: "*.log"
+          if-no-files-found: ignore
+          retention-days: 14
+
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  wasi:
+    name: WASI (Rust only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - name: Record toolchain
+        run: |
+          rustc --version --verbose | tee toolchain.log
+          cargo --version | tee -a toolchain.log
+      - name: Build without the C regex engine
+        run: cargo build --locked --release --target wasm32-wasip1 --no-default-features --features rust-matcher 2>&1 | tee wasi-build.log
+      - name: Record target dependencies
+        run: cargo tree --locked --target wasm32-wasip1 --no-default-features --features rust-matcher -e normal > wasi-dependencies.log
+      - name: Upload WASI binary and validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-matcher-wasip1
+          path: |
+            target/wasm32-wasip1/release/grep.wasm
+            *.log
+          if-no-files-found: ignore
+          retention-days: 14
