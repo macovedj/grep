@@ -16,6 +16,9 @@ use uucore::show_warning;
 
 static ONIG_NEW_MUTEX: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+mod gnu_syntax;
+
 pub struct Matcher<'a> {
     config: &'a Config<'a>,
     patterns: Vec<CompiledPattern>,
