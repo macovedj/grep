@@ -252,7 +252,35 @@ fn plain_literal(pattern: &str, ignore_case: bool, mode: RegexMode) -> Option<Ve
     plain.then(|| pattern.as_bytes().to_vec())
 }
 
-struct CompiledPattern {
+enum CompiledPattern {
+    Onig(OnigPattern),
+}
+
+impl CompiledPattern {
+    fn compile(pattern: &str, config: &Config) -> UResult<Self> {
+        OnigPattern::compile(pattern, config).map(Self::Onig)
+    }
+
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> Option<(usize, usize)> {
+        match self {
+            Self::Onig(pattern) => pattern.search_leftmost(line, offset),
+        }
+    }
+
+    fn longest_end_at(&self, line: &[u8], start: usize) -> Option<usize> {
+        match self {
+            Self::Onig(pattern) => pattern.longest_end_at(line, start),
+        }
+    }
+
+    fn is_match(&self, line: &[u8]) -> bool {
+        match self {
+            Self::Onig(pattern) => pattern.is_match(line),
+        }
+    }
+}
+
+struct OnigPattern {
     /// Default semantics. It's decently fast and used for searching.
     leftmost: OnigRegex,
     /// Compiled with `FIND_LONGEST`. If used for a search, it'll search the
@@ -261,7 +289,7 @@ struct CompiledPattern {
     longest_anchored: OnigRegex,
 }
 
-impl CompiledPattern {
+impl OnigPattern {
     fn compile(pattern: &str, config: &Config) -> UResult<Self> {
         let mut syntax = *match config.regex_mode {
             RegexMode::Fixed => Syntax::asis(),
