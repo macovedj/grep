@@ -433,7 +433,10 @@ fn bracket(chars: &[char], start: usize, output: &mut String) -> UResult<usize> 
                 if previous_class || previous_range_end || chars.get(ix + 1) == Some(&'-') {
                     return Err(invalid("Invalid range end"));
                 }
-                if previous_literal.is_some_and(|left| left > chars[ix + 1]) {
+                if previous_literal
+                    .zip(chars.get(ix + 1))
+                    .is_some_and(|(left, &right)| left > right)
+                {
                     return Err(invalid("Invalid range end"));
                 }
                 output.push('-');
@@ -808,5 +811,32 @@ mod repetition_helper_tests {
             literal(&mut output, ch);
         }
         assert_eq!(output, r"a\[\\d\]\+\?\(b\)\{2\}\^\$");
+    }
+}
+
+#[cfg(test)]
+mod unterminated_range_tests {
+    use super::translate;
+    use crate::RegexMode::{Basic, Extended};
+
+    #[test]
+    fn unterminated_range_reports_an_error_instead_of_panicking() {
+        for pattern in ["[a-", "[^a-", "[é-", "prefix[a-"] {
+            for mode in [Basic, Extended] {
+                let error = translate(pattern, mode).expect_err(pattern);
+                assert_eq!(error.code(), 2, "{pattern}");
+                assert!(error.to_string().contains("unmatched opening bracket"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_hyphen_before_the_closing_bracket_still_is_literal() {
+        for mode in [Basic, Extended] {
+            assert_eq!(
+                translate("[a-]", mode).expect("trailing hyphen"),
+                r"[a\x2d]"
+            );
+        }
     }
 }
