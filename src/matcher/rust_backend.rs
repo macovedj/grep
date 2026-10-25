@@ -10,6 +10,15 @@ use super::gnu_syntax;
 use crate::RegexMode;
 use uucore::error::{UResult, USimpleError};
 
+use regex_automata::{
+    Anchored, Input, MatchKind,
+    hybrid::dfa::{self, OverlappingState},
+    meta,
+    nfa::thompson,
+    util::syntax,
+};
+use std::sync::Mutex;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextProfile {
     Ascii,
@@ -107,6 +116,91 @@ fn escape_literal(pattern: &str, profile: TextProfile) -> String {
     }
 }
 
+const DFA_CACHE_CAPACITY: usize = 8 * 1024 * 1024;
+
+struct Regular {
+    first: meta::Regex,
+    all: dfa::DFA,
+    cache: Mutex<dfa::Cache>,
+}
+
+impl Regular {
+    fn compile(
+        pattern: &str,
+        profile: TextProfile,
+        ignore_case: bool,
+        dot_matches_new_line: bool,
+    ) -> Result<Self, String> {
+        let syntax = syntax::Config::new()
+            .utf8(false)
+            .unicode(profile.unicode())
+            .case_insensitive(ignore_case)
+            .dot_matches_new_line(dot_matches_new_line);
+        let first = meta::Regex::builder()
+            .configure(meta::Config::new().utf8_empty(false))
+            .syntax(syntax)
+            .build(pattern)
+            .map_err(|e| e.to_string())?;
+        // Validate and compile the NFA now, but construct DFA transitions
+        // only as searches need them. Eager determinization makes bounded
+        // Unicode repetitions expensive even when no input is searched.
+        let all = dfa::Builder::new()
+            .configure(
+                dfa::Config::new()
+                    .match_kind(MatchKind::All)
+                    .cache_capacity(DFA_CACHE_CAPACITY),
+            )
+            .syntax(syntax)
+            .thompson(thompson::Config::new().utf8(false))
+            .build(pattern)
+            .map_err(|e| e.to_string())?;
+        let cache = Mutex::new(all.create_cache());
+        Ok(Self { first, all, cache })
+    }
+
+    fn search_leftmost(&self, line: &[u8], offset: usize) -> UResult<Option<(usize, usize)>> {
+        if offset > line.len() {
+            return Ok(None);
+        }
+        Ok(self
+            .first
+            .find(Input::new(line).range(offset..line.len()))
+            .map(|found| (found.start(), found.end())))
+    }
+
+    fn longest_end_at(&self, line: &[u8], start: usize) -> UResult<Option<usize>> {
+        if start > line.len() {
+            return Ok(None);
+        }
+        // MatchKind::All alone does not implement leftmost-longest.
+        // Anchor at the leftmost start established by the first pass,
+        // retain the original haystack for assertions, then select the
+        // largest endpoint among overlapping matches at that start.
+        let input = Input::new(line)
+            .range(start..line.len())
+            .anchored(Anchored::Yes);
+        let mut state = OverlappingState::start();
+        let mut longest = None;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| error("regular matcher cache was poisoned"))?;
+        loop {
+            self.all
+                .try_search_overlapping_fwd(&mut cache, &input, &mut state)
+                .map_err(|e| error(format!("match failed: {e}")))?;
+            let Some(found) = state.get_match() else {
+                return Ok(longest);
+            };
+            longest = Some(longest.map_or(found.offset(), |end: usize| end.max(found.offset())));
+        }
+    }
+
+    fn is_match(&self, line: &[u8]) -> UResult<bool> {
+        Ok(self.first.is_match(line))
+    }
+}
+
 #[cfg(test)]
 mod profile_tests {
     use super::{TextProfile, escape_literal, translate_for_profile};
@@ -160,5 +254,116 @@ mod profile_tests {
             translate_for_profile("é+", RegexMode::Extended, TextProfile::Unicode).unwrap(),
             "é+",
         );
+    }
+}
+
+#[cfg(test)]
+mod regular_tests {
+    use super::{Regular, TextProfile, escape_literal, translate_for_profile};
+    use crate::RegexMode;
+
+    fn compile(pattern: &str, profile: TextProfile) -> Regular {
+        Regular::compile(pattern, profile, false, false).expect("supported regular expression")
+    }
+
+    #[test]
+    fn regular_path_selects_leftmost_then_longest() {
+        let pattern = compile("a|aa", TextProfile::Ascii);
+        assert_eq!(pattern.search_leftmost(b"zaab", 0).unwrap(), Some((1, 2)));
+        assert_eq!(pattern.longest_end_at(b"zaab", 1).unwrap(), Some(3));
+        assert_eq!(pattern.search_leftmost(b"zaab", 2).unwrap(), Some((2, 3)));
+    }
+
+    #[test]
+    fn bounded_unicode_repetitions_use_the_regular_engine() {
+        let pattern = compile(r"\w{3,12}_(a|b)", TextProfile::Unicode);
+        for line in ["!Δelta_a?", "!Привет_b?"] {
+            let start = 1;
+            let end = line.len() - 1;
+            assert_eq!(
+                pattern.search_leftmost(line.as_bytes(), 0).unwrap(),
+                Some((start, end)),
+            );
+            assert_eq!(
+                pattern.longest_end_at(line.as_bytes(), start).unwrap(),
+                Some(end),
+            );
+        }
+        assert_eq!(pattern.longest_end_at(b"!ab_a?", 1).unwrap(), None);
+    }
+
+    #[test]
+    fn anchored_longest_keeps_the_original_haystack() {
+        let pattern = compile("^a+", TextProfile::Ascii);
+        assert_eq!(pattern.longest_end_at(b"baaa", 1).unwrap(), None);
+        assert_eq!(pattern.search_leftmost(b"baaa", 1).unwrap(), None);
+        assert_eq!(pattern.longest_end_at(b"aaa", 0).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn ambiguous_regular_patterns_do_not_enter_the_backtracking_vm() {
+        let pattern = compile("(a|aa)+", TextProfile::Ascii);
+        let line = vec![b'a'; 10_000];
+        assert_eq!(pattern.longest_end_at(&line, 0).unwrap(), Some(line.len()));
+    }
+
+    #[test]
+    fn unicode_regular_searches_survive_malformed_byte_prefixes() {
+        let pattern = compile("[[:alpha:]]", TextProfile::Unicode);
+        let line = b"\xE2\x82b";
+        assert_eq!(pattern.search_leftmost(line, 0).unwrap(), Some((2, 3)));
+        assert!(pattern.is_match(line).unwrap());
+    }
+
+    #[test]
+    fn c_locale_dot_consumes_individual_non_ascii_bytes() {
+        let pattern = compile(".", TextProfile::Ascii);
+        assert_eq!(pattern.search_leftmost(b"\xFF", 0).unwrap(), Some((0, 1)));
+        let pattern = compile(".", TextProfile::Unicode);
+        assert_eq!(pattern.search_leftmost(b"\xFF", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_long_regular_miss_does_not_enter_the_backtracking_vm() {
+        let pattern = compile(r"foo[0-9]+", TextProfile::Ascii);
+        assert_eq!(
+            pattern.search_leftmost(&vec![b'x'; 1 << 20], 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn fixed_strings_escape_bytes_in_c_and_scalars_in_unicode() {
+        let ascii = compile(
+            &escape_literal("é.*", TextProfile::Ascii),
+            TextProfile::Ascii,
+        );
+        let unicode = compile(
+            &escape_literal("é.*", TextProfile::Unicode),
+            TextProfile::Unicode,
+        );
+        assert!(ascii.is_match("xé.*x".as_bytes()).unwrap());
+        assert!(unicode.is_match("xé.*x".as_bytes()).unwrap());
+        assert!(!ascii.is_match("xéxx".as_bytes()).unwrap());
+        assert!(!unicode.is_match("xéxx".as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn c_regex_translation_preserves_byte_atoms_and_bracket_ranges() {
+        for (raw, input, expected) in [
+            ("café", "café".as_bytes(), Some((0, 5))),
+            ("ß", "ß".as_bytes(), Some((0, 2))),
+            ("é+", "éé".as_bytes(), Some((0, 2))),
+            ("[é]", "é".as_bytes(), Some((0, 1))),
+            ("[é-ê]", b"\xB0".as_slice(), Some((0, 1))),
+            ("é+?", b"x".as_slice(), None),
+            ("é+?", b"\xC3".as_slice(), Some((0, 1))),
+        ] {
+            let translated =
+                translate_for_profile(raw, RegexMode::Extended, TextProfile::Ascii).unwrap();
+            let pattern = compile(&translated, TextProfile::Ascii);
+            let found = pattern.search_leftmost(input, 0).unwrap();
+            assert_eq!(found, expected, "C-locale pattern {raw:?}");
+        }
     }
 }
