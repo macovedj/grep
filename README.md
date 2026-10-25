@@ -52,6 +52,9 @@ cargo build --release
 cargo test
 ```
 
+An optional Rust backend is available through the `rust-matcher` Cargo feature.
+See [Rust matcher](docs/rust-matcher.md) for build configurations and supported behavior.
+
 ## Pre-commit hooks
 
 This project uses [pre-commit](https://pre-commit.com); run `pre-commit install` to enable the git hooks.
